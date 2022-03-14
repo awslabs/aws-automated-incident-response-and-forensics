@@ -1,0 +1,403 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates parts of Forensics Env
+
+
+Parameters:  
+  S3VPCFlowLogs:
+    Type: String
+    Description: Name of the Forensic Account S3 Bucket for VPC Flow Logs. Usually it's <this account ID>-vpc-flowlogs
+    Default: '-vpc-flowlogs'
+    AllowedPattern: "[a-zA-Z0-9-.]*"
+    ConstraintDescription: bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-).
+
+
+Resources:
+##################
+  # Maintenance VPC:
+  MaintenanceVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: MaintenanceVPC
+
+  #Enable flow logs on Maintenance VPC
+  MaintenanceFlowLogs: 
+    Type: "AWS::EC2::FlowLog"
+    Properties:
+      ResourceType: "VPC"
+      ResourceId: !Ref MaintenanceVPC
+      TrafficType: "ALL"
+      LogDestinationType: "s3"
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${pkt-srcaddr} ${pkt-dstaddr} ${region} ${pkt-src-aws-service} ${flow-direction}'
+      LogDestination: !Sub "arn:${AWS::Partition}:s3:::${S3VPCFlowLogs}"
+      Tags:
+        - Key: Name
+          Value: VpcFlowLogs-MaintenanceVPC
+
+  # MaintenanceVPC - internet access:     
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: MaintenanceVPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  #Maintenance Subnets - public and private
+  MaintenancePublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      CidrBlock: 10.0.0.0/17
+      AvailabilityZone: !Select [ 0, !GetAZs ]    # Get the first AZ in the list       
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-Maintenance-Public
+
+  MaintenancePrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      CidrBlock: 10.0.128.0/17
+      AvailabilityZone: !Select [ 0, !GetAZs ]    # Get the first AZ in the list 
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-Maintenance-Private
+  
+  # Security groups for MaintenanceVPC
+  SecurityGroupPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public security group with just egress rule
+      SecurityGroupEgress:
+      - IpProtocol: "-1"
+        CidrIp: 0.0.0.0/0
+      VpcId:
+        Ref: MaintenanceVPC
+
+  SecurityGroupPrivate:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: MaintenanceVPC
+    Properties:
+      GroupDescription: Private security group
+      VpcId:
+        Ref: MaintenanceVPC
+  SecurityGroupPrivateIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: SecurityGroupPrivate
+    Properties:
+      GroupId:
+        Ref: SecurityGroupPrivate
+      IpProtocol: "-1"
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId:
+        Ref: SecurityGroupPrivate
+  SecurityGroupPrivateEgressRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: SecurityGroupPrivate
+    Properties:
+      IpProtocol: "-1"
+      FromPort: 0
+      ToPort: 65535
+      CidrIp: 0.0.0.0/0
+      GroupId:
+        Ref: SecurityGroupPrivate
+  
+  # A NAT Gateway:
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref MaintenancePublicSubnet
+      Tags:
+      - Key: Name
+        Value: !Sub NAT-${AWS::StackName}
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: "vpc"
+
+  # Route tables for Maintenance subnets:
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      Tags:
+      - Key: Name
+        Value: Public Route
+  PublicRoute:   # Public route table has direct routing to IGW:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  # Private route table:
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      Tags:
+      - Key: Name
+        Value: Private Route
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      # Route traffic through the NAT Gateway:
+      NatGatewayId: !Ref NATGateway
+
+  # Attaching subnets to route tables:   
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MaintenancePublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MaintenancePrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+##################################
+# EC2 Image Builder - to build Forensic AMI based on Ununtu 20 and SIFT
+
+  # Create an S3 Bucket for logs.
+  # When deleting the stack, make sure to empty the bucket first.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-s3-bucket.html
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    # If you want to delete the stack, but keep the bucket, set the DelectionPolicy to Retain.
+    # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html
+    # DeletionPolicy: Retain
+
+  # By default, AWS Services do not have permission to perform actions on your instances. This grants
+  # AWS Systems Manager (SSM) and EC2 Image Builder the necessary permissions to build an image.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html
+  # https://docs.aws.amazon.com/imagebuilder/latest/userguide/image-builder-setting-up.html
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      Path: /executionServiceEC2Role/
+
+  # Policy to allow the instance to write to the S3 bucket (via instance role / instance profile).
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html
+  InstanceRoleLoggingPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to save log files to an S3 bucket.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET:
+                      Ref: ImageBuilderLogBucket
+
+  # To pass the InstanceRole to an EC2 instance, we need an InstanceProfile.
+  # This profile will be used during the image build process.
+  # https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - Ref: InstanceRole
+
+  # Specifies the infrastructure within which to build and test your image.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-infrastructureconfiguration.html
+  SIFTImageInfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: UbuntuServer20-Image-Infrastructure-Configuration
+      InstanceProfileName:
+        Ref: InstanceProfile
+      # Set of one or more instance types to use when building the instance. Image Builder will select a type
+      # based on availability.
+      InstanceTypes: ["t2.medium", "t2.large", "t2.xlarge", "t3.medium", "t3.large", "t3.xlarge"]
+      # Specify an S3 bucket and EC2 Image Builder will save logs to the bucket.
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+          S3KeyPrefix: !Join [ "-", [ 'imagebuilder', !Ref "AWS::StackName" ] ]
+      # If you would like to keep the instance running after a failed build, set TerminateInstanceOnFailure to false.
+      TerminateInstanceOnFailure: false
+      # If you do not have a default VPC or want to use a different VPC, you must specify the IDs of a subnet and one or more
+      # security groups to be associated with the build instance.
+      SubnetId: !Ref MaintenancePrivateSubnet
+      SecurityGroupIds: 
+        - !Ref SecurityGroupPrivate
+
+  # Create a custom EC2 Image Builder component that downloads and installs the latest .NET 5 preview. The component includes a
+  # validation step which will run after the install but before the image capture. Also included, is a test step which
+  # runs after the image is captured (EC2 Image Builder launches a new instance from the image and runs the test phase).
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-component.html
+  InstallSIFTComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: install-SIFT
+      Version: 1.0.0
+      Description: Installs SIFT (https://github.com/teamdfir/sift) from scratch
+      ChangeDescription: First version
+      Platform: Linux
+      Data: |
+        name: InstallSIFTDocument
+        description: This is a EC2 Image Builder document to install SIFT on Ubuntu 20 LTS
+        schemaVersion: 1.0
+
+        phases:
+          - name: build
+            steps:
+              - name: InstallSIFT
+                action: ExecuteBash
+                timeoutSeconds: -1
+                inputs:
+                  commands:
+                    - |
+                      sudo su
+                      su - ubuntu
+                      cd ~
+                      sudo systemctl stop apt-daily.timer
+                      sudo systemctl stop apt-daily.service
+                      sudo systemctl stop apt-daily-upgrade.service
+                      sudo apt upgrade -y && sudo apt upgrade -y
+                      sudo apt autoremove -y
+                      wget https://golang.org/dl/go1.17.2.linux-amd64.tar.gz
+                      sudo tar -C /usr/local -xzf go1.17.2.linux-amd64.tar.gz
+                      export PATH=$PATH:/usr/local/go/bin
+                      go install github.com/sigstore/cosign/cmd/cosign@latest
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli-linux
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli-linux.sig
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli.pub
+                      /home/ubuntu/go/bin/cosign verify-blob -key sift-cli.pub -signature sift-cli-linux.sig sift-cli-linux
+                      sudo mv sift-cli-linux /usr/local/bin/sift
+                      chmod 755 /usr/local/bin/sift
+                      sudo sift install --mode=server --user=ubuntu
+  #                    sudo sift install --mode=desktop --user=ubuntu
+  # Recipe which references the latest (x.x.x) version of Ubuntu Server 20 AMI.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-imagerecipe.html
+  SIFTImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: SIFTImageRecipe
+      Version: 1.0.0
+      # ${AWS::Partition} returns the partition where you are running the CloudFormation template. For standard AWS regions, the
+      # partition is aws. For resources elsewhere, the partition is aws-partitionname. For example, China (Beijing and Ningxia)
+      # regions use aws-cn and AWS GovCloud (US) regions are aws-us-gov.
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
+      ParentImage:
+        Fn::Sub: arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/ubuntu-server-20-lts-x86/x.x.x
+      BlockDeviceMappings:
+        - DeviceName: '/dev/sda1'
+          Ebs:
+            VolumeSize: 30
+            VolumeType: "gp2"
+      Components:
+        - ComponentArn: !Join ['',['arn:aws:imagebuilder:',!Ref 'AWS::Region',':aws:component/update-linux/x.x.x']]
+        - ComponentArn: !Join ['',['arn:aws:imagebuilder:',!Ref 'AWS::Region',':aws:component/amazon-cloudwatch-agent-linux/x.x.x']]
+        - ComponentArn: !Join ['',['arn:aws:imagebuilder:',!Ref 'AWS::Region',':aws:component/aws-cli-version-2-linux/x.x.x']]
+        - ComponentArn:
+            Ref: InstallSIFTComponent
+        - ComponentArn: !Join ['',['arn:aws:imagebuilder:',!Ref 'AWS::Region',':aws:component/reboot-test-linux/x.x.x']]
+        - ComponentArn: !Join ['',['arn:aws:imagebuilder:',!Ref 'AWS::Region',':aws:component/reboot-linux/x.x.x']]
+  # The Image resource will show complete in CloudFormation once your image is done building. Use this resource later in your
+  # stack to reference the image within other resources.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-image.html
+  SIFTImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn:
+        Ref: SIFTImageRecipe
+      InfrastructureConfigurationArn:
+        Ref: SIFTImageInfrastructureConfiguration
+
+  # Create an SSM Parameter Store entry with our resulting ImageId.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ssm-parameter.html
+  SIFTImageParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: Image Id for Ubuntu Server 20 With latest SIFT
+      Name: /Test/Images/SIFTImage
+      Type: String
+      Value:
+        Fn::GetAtt: [SIFTImage, ImageId]
+  
+  SIFTDistributionConfiguration:
+    Type: 'AWS::ImageBuilder::DistributionConfiguration'
+    Properties:
+      Name: 'SIFT-distribution-configuration'
+      Description: 'Forensic image distribution'
+      Distributions:
+        - Region: !Ref 'AWS::Region'
+          AmiDistributionConfiguration:
+            Name: 'ami-forensic-image {{ imagebuilder:buildDate }}'
+            Description: 'Forensics golden image'
+
+  # Optionally, uncomment the below resource to create an automation pipeline for your container image builds.
+  # In this example, the pipeline is scheduled to run a build at 9:00AM Coordinated Universal Time (UTC) on the first day of every month.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-imagepipeline.html
+  ForensicImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: 'Forensic-Image-Pipeline'
+      Description: 'Creates a image build pipeline that deploys a Forensic image to current region at 9AM UTC every Sunday'
+      Status: ENABLED
+      ImageRecipeArn: !Ref SIFTImageRecipe 
+      InfrastructureConfigurationArn: !Ref SIFTImageInfrastructureConfiguration
+      DistributionConfigurationArn: !Ref SIFTDistributionConfiguration
+      #ImageTestsConfiguration:
+      #  ImageTestsEnabled: true
+      #  TimeoutMinutes: 160
+      Schedule:
+        ScheduleExpression: 'cron(0 9 ? * sun)'
+        PipelineExecutionStartCondition: 'EXPRESSION_MATCH_ONLY'
+
+# END: EC2 Image Builder - to build Forensic AMI based on Ubuntu 20 and SIFT
+##################################

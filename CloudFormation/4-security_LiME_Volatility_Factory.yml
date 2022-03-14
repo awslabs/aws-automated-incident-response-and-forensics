@@ -1,0 +1,874 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: The kernel module factory.  It will spin up EC2 Instances for the AMIs that you have specified; and it will go through and build all of the LiME kernel modules it can and upload them to S3
+
+Parameters:
+
+  pVpcId:
+    Type: "AWS::EC2::VPC::Id"
+    Description: ID of the VPC to create instances
+  
+  pSubnetId:
+    Type: "AWS::EC2::Subnet::Id"
+    Description: Subnet to create Instances
+    
+  pAmiIds:
+    Type: "List<AWS::EC2::Image::Id>"
+    Description: Amazon Linux AMI for DD Copy. Note that this can be a list of AMIs (e.g. ami-035be7bafff33b6b6,ami-995be7bafff33b6b8,ami-0be7bafff33b6b635 )
+    Default: "ami-00dfe2c7ce89a450b" #amazon linux v2
+    #was: "ami-035be7bafff33b6b6" but seems is no longer available
+
+  pSecurtiyAccount:
+    Type: String
+    Description: AWS Account Number of the Security Account where snapshot processing occurs
+    AllowedPattern: "[0-9]*"
+    MaxLength: 12
+    MinLength: 12
+    ConstraintDescription: account number must contain only numbers.
+
+  pOrgId:
+    Type: String
+    Description: Organization ID to which the target accounts belong
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+    MaxLength: 34
+    MinLength: 12
+    ConstraintDescription: Organization ID string requires "o-" followed by from 10 to 32 lowercase letters or digits.
+
+
+  pArtifactBucket:
+    Type: String
+    Description: ARN of the S3 Bucket for the memory 
+
+Resources:
+
+  rEc2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LINUX_MODULE_GENERATION_EC2ROLE
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: AutomationRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:GetBucketLocation"
+                Resource: !Ref pArtifactBucket
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource: !Sub "${pArtifactBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "ec2:StopInstances"
+                Resource: "*"
+
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+  
+  rEc2Profile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref rEc2Role
+      InstanceProfileName: ModuleFactoryRole
+  
+  rSecGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref pVpcId
+      GroupName: ModuleFactorySecGroup
+      GroupDescription: Security Group for Module Generation VMs
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '1'
+          ToPort: '65535'
+          CidrIp: '0.0.0.0/0'
+
+  rLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: MemoryModuleFactoryLambdaRole
+      Path: /
+      Policies:
+        - PolicyName: FindingRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "iam:PassRole"
+                Resource: !GetAtt rEc2Role.Arn
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:*"
+              - Effect: Allow
+                Action:
+                  - "ec2:RunInstances"
+                  - "ec2:StartInstances"
+                  - "ec2:TerminateInstances"
+                  - "ec2:CreateTags"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeImages"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                  - "ssm:GetCommandInvocation"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub "${pArtifactBucket}/*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+              
+  rCreateBootstrap1:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Environment:
+        Variables:
+          S3Bucket: !Select [5,!Split [ ':', !Ref pArtifactBucket]]
+          Region: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          
+          import boto3
+          import os
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(os.environ.get("S3Bucket"))
+                  
+                  if event['RequestType'] == 'Create':                   
+                      script_body = '''#!/bin/bash
+          export BUCKET=%(bucket)s
+          export HOME=`pwd`
+          
+          if [ -e /usr/bin/yum ]
+          then
+            yum -y install epel-release
+            yum makecache
+            yum -y install git dkms libdwarf-tools
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+            which systemctl && systemctl enable amazon-ssm-agent && systemctl restart amazon-ssm-agent || start amazon-ssm-agent
+          
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get -y install git dkms libdwarf-dev snap dwarfdump libelf-dev zip
+            snap install amazon-ssm-agent
+            snap start amazon-ssm-agent
+            snap enable amazon-ssm-agent
+          fi
+          
+          aws s3 cp s3://%(bucket)s/bootstrap2.sh .
+          chmod a+x bootstrap2.sh
+          sed -i 's/_|-/\\\\/g' bootstrap2.sh
+          ./bootstrap2.sh
+          
+          aws s3 cp s3://%(bucket)s/bootstrap3.sh .
+          chmod a+x bootstrap3.sh
+          sed -i 's/_|-/\\\\/g' bootstrap3.sh
+          ./bootstrap3.sh
+          
+          aws s3 cp s3://%(bucket)s/startup.sh /usr/local/bin/update_script.sh
+          chmod a+x /usr/local/bin/update_script.sh
+          
+          if [ -e /usr/bin/yum ]
+          then
+            for i in `yum list kernel --showduplicates|awk '{ print $2 }'|tail -n +6`
+            do
+              yum -y install kernel-${i} kernel-devel-${i} kernel-headers-${i}
+              sleep 5
+              dkms build -m lime -v 1.8 -k ${i}.x86_64
+              dkms build -m volatility -v 2.6.1 -k ${i}.x86_64
+            done
+          else          
+            for i in `apt-cache search linux-aws-headers|cut -f 1 -d " "|cut -f 4,5 -d -`
+            do
+              DEBIAN_FRONTEND=noninteractive apt-get -y install linux-aws-headers-${i} linux-aws-tools-${i} linux-image-${i}-aws linux-headers-${i}
+              sleep 5
+              dkms build -m lime -v 1.8 -k ${i}-aws
+              dkms build -m volatility -v 2.6.1 -k ${i}-aws
+            done
+          fi
+          
+          echo -e \"SHELL=/bin/bash\nPATH=/sbin:/bin:/usr/bin:/usr/sbin\n*/2 * * * * root flock -nx /tmp/lock -c /usr/local/bin/update_script.sh\" > /etc/cron.d/update_modules
+          
+          init 6          
+                      ''' % { "bucket": os.environ.get("S3Bucket") }
+                                            
+                      bucket.Object("bootstrap.sh").put(
+                          Body=script_body
+                      )
+                                            
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "data": "Success"
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateBootstrap1
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+      Description: Create raw volume copies and upload to S3
+      
+  rCustomBootstrap1:
+    Type: Custom::CreateBootstrap
+    Properties:
+      ServiceToken: !GetAtt [ rCreateBootstrap1, Arn ]
+
+  rCreateBootstrap2:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Environment:
+        Variables:
+          S3Bucket: !Select [5,!Split [ ':', !Ref pArtifactBucket]]
+          Region: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          
+          import boto3
+          import os
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(os.environ.get("S3Bucket"))
+                  
+                  if event['RequestType'] == 'Create':                   
+                      script_body = '''#!/bin/bash
+          export BUCKET=%(bucket)s
+          export HOME=`pwd`
+                    
+          git clone https://github.com/504ensicsLabs/LiME.git
+          cd LiME/src
+          
+          sed -i 's/^\(.*\)\(mv lime.ko\)\(.*\)$/_|-1_|-2_|-3_|-n_|-1aws s3 cp_|-3 s3:\/\/${BUCKET}\/${osname}\/${kernelver}\//g' Makefile
+          sed -i 's/mv lime.ko/cp lime.ko/g' Makefile
+          sed -i 's/$(KVER)/${kernelver}/g' Makefile
+          sed -i 's/${KVER}/${kernelver}/g' Makefile
+          sed -i 's/^\(KVER\)\(.*\)/BUCKET ?= %(bucket)s_|-n_|-1_|-2/g' Makefile
+          sed -i 's/\(^KVER\)\(.*\)/osname ?= $\(shell cat \/etc\/os-release |grep PRETTY|cut -d \\\\\\\" -f 2| sed \\\"s\/ \/_\/g\\\"\)_|-n_|-1_|-2/g' Makefile
+          
+          tee dkms.conf << eof
+          PACKAGE_NAME="lime"
+          PACKAGE_VERSION="1.8"
+          BUILT_MODULE_NAME[0]="lime"
+          DEST_MODULE_LOCATION[0]="/kernel/lime/"
+          AUTOINSTALL="no"
+          MAKE[0]="make"
+          eof
+          
+          if [ ! -e /usr/src/lime-1.8 ]
+          then
+            mkdir /usr/src/lime-1.8
+          fi
+          
+          cp -rfn * /usr/src/lime-1.8/
+          
+          dkms add -m lime -v 1.8
+                      ''' % { "bucket": os.environ.get("S3Bucket") }
+                                            
+                      bucket.Object("bootstrap2.sh").put(
+                          Body=script_body
+                      )
+                      
+                      start_script = '''#!/bin/bash
+          if [ -e /usr/bin/yum ]
+          then
+            yum -y remove `rpm -qa|grep kernel|grep -v $(uname -r)`
+            yum makecache
+            yum -y upgrade
+            if [ `rpm -qa|grep dkms|wc -l` -eq 0 ]
+            then
+              yum -y install dkms
+            fi
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+          fi
+          
+          for i in `ls -1 /boot|grep System.map|awk -F map '{ print $2 }'|cut -c2- | grep -v $(uname -r)`
+          do
+            dkms build -m lime -v 1.8 -k $i
+            dkms build -m volatility -v 2.6.1 -k $i
+          done
+          
+          inst=`curl http://169.254.169.254/latest/meta-data/instance-id/`
+          aws --region %(region)s ec2 stop-instances --instance-ids $inst
+                      ''' % { "region": os.environ.get("Region") }
+                      
+                      bucket.Object("startup.sh").put(
+                          Body=start_script
+                      )
+                      
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "data": "Success"
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateBootstrap2
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+      Description: Create raw volume copies and upload to S3
+      
+  rCustomBootstrap2:
+    Type: Custom::CreateBootstrap
+    Properties:
+      ServiceToken: !GetAtt [ rCreateBootstrap2, Arn ]
+
+  rCreateBootstrap3:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Environment:
+        Variables:
+          S3Bucket: !Select [5,!Split [ ':', !Ref pArtifactBucket]]
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          
+          import boto3
+          import os
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(os.environ.get("S3Bucket"))
+                  
+                  if event['RequestType'] == 'Create':                   
+                      script_body = '''#!/bin/bash
+          export BUCKET=%(bucket)s
+          export HOME=`pwd`
+                    
+          git clone https://github.com/volatilityfoundation/volatility.git
+          cd volatility/tools/linux
+          sed -i 's/^\(.*\)\(dwarfdump\)\(.*\)$/_|-1_|-2_|-3_|-n_|-1mkdir \/tmp\/${kernelver}_|-n_|-1cp module.dwarf \/tmp\/${kernelver}\/_|-n_|-1cp ${mapfile} \/tmp\/${kernelver}\/System.map-${kernelver}_|-n_|-1zip \/tmp\/${kernelver}-profile.zip \/tmp\/${kernelver}\/*_|-n_|-1aws s3 cp \/tmp\/${kernelver}-profile.zip s3:\/\/${BUCKET}\/${osname}\/${kernelver}\/_|-n_|-1 rm -rf \/tmp\/${kernelver}*/g' Makefile
+          sed -i 's/^\(.*\)\(\$(MAKE\)\(.*\)\(clean\)$/_|-1_|-2_|-3_|-4_|-n_|-1touch volatility.ko/g' MakeFile
+          sed -i 's/$(KVER)/${kernelver}/g' Makefile
+          sed -i 's/${KVER}/${kernelver}/g' Makefile
+          sed -i 's/^\(KVER\)\(.*\)/BUCKET ?= %(bucket)s_|-n_|-1_|-2/g' Makefile
+          sed -i 's/\(^KVER\)\(.*\)/osname ?= $\(shell cat \/etc\/os-release |grep PRETTY|cut -d \\\\\\\" -f 2| sed \\\"s\/ \/_\/g\\\"\)_|-n_|-1_|-2/g' Makefile
+          
+          if [ ! -e /usr/bin/yum ]
+          then
+            sed -i 's/\(^KVER\)\(.*\)/mapfile ?= \/boot\/System.map-${kernelver}_|-n_|-1_|-2/g' Makefile
+          else
+            sed -i 's/\(^KVER\)\(.*\)/mapfile ?= \/usr\/src\/kernels\/${kernelver}\/System.map_|-n_|-1_|-2/g' Makefile
+          fi
+          
+          tee dkms.conf << eof
+          PACKAGE_NAME="volatility"
+          PACKAGE_VERSION="2.6.1"
+          BUILT_MODULE_NAME[0]="volatility"
+          DEST_MODULE_LOCATION[0]="/kernel/volatility/"
+          AUTOINSTALL="no"
+          MAKE[0]="make"
+          eof
+          
+          if [ ! -e /usr/src/volatility-2.6.1 ]
+          then
+            mkdir /usr/src/volatility-2.6.1
+          fi
+          
+          cp -rfn * /usr/src/volatility-2.6.1/
+          
+          dkms add -m volatility -v 2.6.1
+                      ''' % { "bucket": os.environ.get("S3Bucket") }
+                                            
+                      bucket.Object("bootstrap3.sh").put(
+                          Body=script_body
+                      )
+                                            
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "data": "Success"
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateBootstrap3
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+      Description: Create raw volume copies and upload to S3
+      
+  rCustomBootstrap3:
+    Type: Custom::CreateBootstrap
+    Properties:
+      ServiceToken: !GetAtt [ rCreateBootstrap3, Arn ]
+
+  rTransformList:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+          
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:    
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "AmiIds": json.dumps(event['ResourceProperties']['AmiIds'])
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: TransformList
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+      Description: Transform list of amiIds to json
+      
+  rCustomTransform:
+    Type: Custom::CreateTransform
+    Properties:
+      ServiceToken: !GetAtt [ rTransformList, Arn ]
+      AmiIds: !Ref pAmiIds
+
+  rCreateInstances:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - rCustomBootstrap1
+      - rCustomBootstrap2
+      - rCustomBootstrap3
+      - rEc2Profile
+    Properties:
+      Environment:
+        Variables:
+          AmiIds: !GetAtt rCustomTransform.AmiIds
+          VpcId: !Ref pVpcId
+          SecGroup: !GetAtt rSecGroup.GroupId
+          Subnet: !Ref pSubnetId
+          Bucket: !Select [5,!Split [ ':', !Ref pArtifactBucket]]
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          
+          import boto3
+          import os
+          import json
+          import cfnresponse
+           
+          def start_instances(ec2, Amis):
+              for ami in Amis:
+                  response = ec2.run_instances(
+                      BlockDeviceMappings=[ x for x in get_root_dev(ec2, ami) ],
+                      ImageId=ami,
+                      InstanceType='t2.large',
+                      SecurityGroupIds=[
+                          os.environ.get('SecGroup')
+                      ],
+                      SubnetId=os.environ.get('Subnet'),
+                      MaxCount=1,
+                      MinCount=1,
+                      TagSpecifications=[
+                          {
+                              "ResourceType": "instance",
+                              "Tags": [
+                                  {
+                                      "Key": "Name",
+                                      "Value": "MemoryCaptureModuleFactory"
+                                  }
+                              ]
+                          }
+                      ],
+                      IamInstanceProfile={
+                          'Name': 'ModuleFactoryRole'
+                      },
+                      UserData='''#!/bin/bash
+              if [ ! -e /usr/bin/yum ]; then apt-get update; apt-get -y install awscli; fi
+              aws s3 cp s3://{}/bootstrap.sh .
+              chmod a+x bootstrap.sh
+              ./bootstrap.sh
+                  '''.format(os.environ.get('Bucket'))
+              )
+          
+          def get_root_dev(ec2, ami):
+              images = ec2.describe_images(ImageIds=[ami])
+              for block in images['Images'][0]['BlockDeviceMappings']:
+                  try:
+                      if block['Ebs']['VolumeSize'] < 40:
+                          block['Ebs']['VolumeSize'] = 40
+                      
+                      for i in ['SnapshotId', 'Encrypted', 'KmsKeyId']:
+                          if i in block['Ebs'].keys():
+                              del block['Ebs'][i]
+                  except KeyError:
+                      continue
+                  
+                  yield block              
+              
+          def list_amis(ec2):
+              response = ec2.describe_instances(
+                  Filters=[{
+                      "Name": "tag:Name",
+                      "Values": [
+                          "MemoryCaptureModuleFactory"
+                      ]
+                  }]
+              )
+              for res in response['Reservations']:
+                  for i in res['Instances']:
+                      yield i['ImageId']
+                                
+          def lambda_handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  
+                  if event['RequestType'] == 'Create':
+                      start_instances(ec2, json.loads(os.environ.get("AmiIds")))
+                  
+                  elif event['RequestType'] == 'Update':
+                      cur_amis = set([ x for x in list_amis(ec2) ])
+                      amis = json.loads(os.environ.get("AmiIds"))
+                      delete = []
+                      for ami in cur_amis:
+                          if ami in amis:
+                              amis.remove(ami)
+                          else:
+                              delete.append(ami)
+                      
+                      if len(amis) > 0:
+                          start_instances(ec2, amis)
+                        
+                      if len(delete) > 0:
+                          delete_instances(ec2, delete)
+                      
+                  elif event['RequestType'] == 'Delete':
+                      delete_instances(ec2, json.loads(os.environ.get("AmiIds")))
+                      
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "data": "Success"
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateInstances
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+        
+  rCustomResource:
+    Type: Custom::CreateInstances
+    DependsOn: rCreateInstances
+    Properties:
+      ServiceToken: !GetAtt [ rCreateInstances, Arn ]
+
+  rDeleteInstances:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - rCustomBootstrap1
+      - rCustomBootstrap2
+      - rCustomBootstrap3
+      - rEc2Profile
+    Properties:
+      Environment:
+        Variables:
+          AmiIds: !GetAtt rCustomTransform.AmiIds
+          VpcId: !Ref pVpcId
+          SecGroup: !GetAtt rSecGroup.GroupId
+          Subnet: !Ref pSubnetId
+          Bucket: !Select [5,!Split [ ':', !Ref pArtifactBucket]]
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          
+          import boto3
+          import os
+          import json
+          import cfnresponse
+           
+                    
+          def list_amis(ec2):
+              response = ec2.describe_instances(
+                  Filters=[{
+                      "Name": "tag:Name",
+                      "Values": [
+                          "MemoryCaptureModuleFactory"
+                      ]
+                  }]
+              )
+              for res in response['Reservations']:
+                  for i in res['Instances']:
+                      yield i['InstanceId']
+          
+          def delete_instances(ec2, amis):
+              to_delete = [ x for x in list_amis(ec2) ]
+                      
+              if len(to_delete) > 0:
+                  ec2.terminate_instances(
+                      InstanceIds=to_delete
+                  )
+                      
+          def lambda_handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                                        
+                  if event['RequestType'] == 'Delete':
+                      delete_instances(ec2, json.loads(os.environ.get("AmiIds")))
+                      
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      {
+                          "data": "Success"
+                      }    
+                  )
+                      
+              except Exception as e:
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      {
+                          "data": "Error Creating parameters: {}".format(repr(e))
+                      }
+                      
+                  )
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DeleteInstances
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'
+        
+  rCustomTeardown:
+    Type: Custom::TearDown
+    DependsOn: rDeleteInstances
+    Properties:
+      ServiceToken: !GetAtt [ rDeleteInstances, Arn ]
+
+  rStartInstancePermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt rStartFactoryInstances.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt [ rStartInstanceSchedule, Arn]
+      
+  rStartInstanceSchedule:
+    Type: "AWS::Events::Rule"
+    Properties: 
+      Description: Start Module Generation
+      Name: StartModuleFactory
+      ScheduleExpression: "cron(0 */6 * * ? *)"
+      State: ENABLED 
+      Targets:
+        - Arn: !GetAtt rStartFactoryInstances.Arn
+          Id: KickoffFactoryUpdate
+          
+  rStartFactoryInstances:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - rCustomBootstrap1
+      - rCustomBootstrap2
+      - rCustomBootstrap3
+    Properties:
+      Code:
+        ZipFile: |
+          #  Copyright 2017 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+          
+          import boto3
+          import os
+          import json
+          import time
+                    
+                      
+          def lambda_handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  ssm = boto3.client('ssm')
+                  
+                  to_start = []
+                  response = ec2.describe_instances(
+                      Filters=[{
+                          "Name": "tag:Name",
+                          "Values": [
+                              "MemoryCaptureModuleFactory"
+                          ]
+                      }]
+                  )
+                  
+                  for res in response['Reservations']:
+                      for i in res['Instances']:
+                          if i['State']['Name'] == 'stopped':
+                              to_start.append(i['InstanceId'])
+                  
+                  if len(to_start) > 0:
+                      ec2.start_instances(
+                          InstanceIds=to_start
+                      )
+                      
+              except Exception as e:
+                  print(repr(e))
+                  raise
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: ManageInstances
+      Timeout: 900
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: '128'

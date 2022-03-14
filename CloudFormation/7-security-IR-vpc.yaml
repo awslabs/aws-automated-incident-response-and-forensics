@@ -1,0 +1,166 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  ir-vpc
+
+  CloudFormation template to deploy and configure a VPC used for IR volume processing
+  
+Parameters:
+  pAvailabilityZone:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Description: Availability Zone to Launch EC2 instance
+  pIRArtifactBucket:
+    Type: String
+    Description: Name of the Forensic Account S3 IR Artifacts Bucket
+    AllowedPattern: "[a-zA-Z0-9-.]*"
+    ConstraintDescription: bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-).
+  pIRVpcCidr:
+    Type: String
+    Description: CIDR for the IR VPC
+    Default: 10.192.0.0/16
+    AllowedPattern: "([0-9.\\/]*)"
+    ConstraintDescription: must meet the form of an IP CIDR (e.g. 10.192.0.0/16).
+  pIRVpcSubnetCidr:
+    Type: String
+    Description: CIDR for the IR VPC Subnet
+    Default: 10.192.1.0/24
+    AllowedPattern: "([0-9.\\/]*)"
+    ConstraintDescription: must meet the form of an IP CIDR (e.g. 10.192.0.0/16).
+
+Resources:
+  rIRVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref pIRVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ir-vpc
+
+  rIRSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref pIRVpcSubnetCidr
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref rIRVpc
+      Tags:
+        - Key: Name
+          Value: ir-subnet
+      AvailabilityZone: !Ref pAvailabilityZone
+
+  rIRRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref rIRVpc
+      Tags:
+        - Key: Name
+          Value: IR VPC Route Table
+  
+  rRouteTableIRSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rIRRouteTable
+      SubnetId: !Ref rIRSubnet  
+
+  rInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Securtiy Group for IR Instance
+      GroupName: ir-instance-sg
+      VpcId: !Ref rIRVpc
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+    
+  rEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Securtiy Group for IR VPC Endpoints
+      GroupName: ir-vpce-sg
+      SecurityGroupIngress:
+      - IpProtocol: 'tcp'
+        FromPort: 443
+        ToPort: 443
+        SourceSecurityGroupId: !Ref rInstanceSecurityGroup 
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref rIRVpc
+
+  rS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+              - 's3:CreateMultipartUpload'
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref rIRRouteTable
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref rIRVpc
+
+  rSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref rIRVpc
+
+  rSSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      VpcEndpointType: Interface
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref rIRVpc
+
+  rEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      VpcEndpointType: Interface
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref rIRVpc

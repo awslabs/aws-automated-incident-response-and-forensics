@@ -1,0 +1,754 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  member-kms-ebs-sharing
+
+  CloudFormation template to deploy and configure resources which enable sharing of EBS snapshots cross account
+
+Parameters:
+  pSecurityAccount:
+    Type: String
+    Description: AWS Account Number of the Security Account where snapshot processing occurs
+    AllowedPattern: "[0-9]*"
+    MaxLength: 12
+    MinLength: 12
+    ConstraintDescription: account number must contain only numbers.
+  
+
+  SGNAME:
+    Type: String
+    Default: security_isolate
+    Description: This will be used to assign or create a Security Group for Isolation.
+
+  SGDESCRIPTION:
+    Type: String
+    Default: Security Group Used for Incident Response Isolation
+    Description: This will be used as description for the Isolation Security Group
+
+  CWRuleName:
+    Type: String
+    Default: EC2TagChangeEvent
+    Description: Name to use on CloudWatch Event Rule to Detect EC2 Tag Changes
+
+  SlackURL:
+    Type: String
+    Description: The Slack URL to be used to send the notifications to Slack
+
+  SlackChannel:
+    Type: String
+    Default: "#taking-over-the-world"
+    Description: The incident channel used within Slack to respond to issues
+
+  SecurityIncidentSNSTopicName:
+    Type: String
+    Default: 'security-incident-slack-events'
+    Description: The SNS topic to send incidents to. This will be used to pass the messages to the Slack Lambda function and send it to Slack
+
+  SecurityAccountIncidentSNSTopicArn:
+    Type: String
+    Description: The ARN of the SNS topic within the Security Account
+
+Resources:
+
+  rVolumeandSnapshotCreateRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: IRAutomation
+      Path: /
+      Policies:
+        - PolicyName: SnapshotAutomationPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "ec2:CreateSnapshot"
+                Resource: !Sub "arn:aws:ec2:*:${AWS::AccountId}:volume/*"
+              - Effect: Allow
+                Action: 
+                  - "ec2:CreateSnapshot"
+                  - "ec2:CopySnapshot"
+                Resource: "arn:aws:ec2:*::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/ir-acquisition: 'True'
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - "ir-acquisition"
+                      - "case-id"
+              - Effect: Allow
+                Action: 
+                  - "ec2:CreateTags"
+                Resource: "arn:aws:ec2:*::snapshot/*"
+                Condition:
+                  ForAnyValue:StringEquals:
+                    ec2:CreateAction: 
+                      - 'CreateSnapshot'
+                      - 'CopySnapshot'
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateTags"
+                Resource: "arn:aws:ec2:*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - 'SecurityIncidentStatus'
+              - Effect: Allow
+                Action: 
+                  - "ec2:ModifySnapshotAttribute"
+                Resource: "arn:aws:ec2:*::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ir-acquisition: 'True'
+              - Effect: Allow
+                Action: 
+                  - "ec2:DeleteSnapshot"
+                Resource: "arn:aws:ec2:*::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ir-acquisition: 'True'
+              - Effect: Allow
+                Action: 
+                  - "ec2:DescribeVolumes"
+                  - "ec2:DescribeSnapshots"
+                  - "ec2:DescribeInstances"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                  - "ssm:GetCommandInvocation"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub 'arn:${AWS::Partition}:iam::${pSecurityAccount}:role/SnapshotAutomationLambdaRole'
+                - !Sub 'arn:${AWS::Partition}:iam::${pSecurityAccount}:role/MemoryAutomationLambdaRole'
+                
+
+  rKmsPolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn: rEbsSnapshotShareKey
+    Properties:
+      PolicyName: CFNUsers
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+              - "kms:GenerateDataKeyWithoutPlainText"
+              - "kms:ReEncrypt"
+            Resource: !GetAtt rEbsSnapshotShareKey.Arn
+          - Effect: Allow
+            Action:
+              - "kms:CreateGrant"
+            Resource: !GetAtt rEbsSnapshotShareKey.Arn
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: 'true'
+      Roles:
+        - !Ref rVolumeandSnapshotCreateRole
+
+  rEbsSnapshotShareKey:
+    Type: AWS::KMS::Key
+    DependsOn: rVolumeandSnapshotCreateRole
+    Properties:
+      Description: Snapshot Automation KMS key for EBS Snapshots and Volumes
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: ir-ebs-policy
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' 
+            Action:
+              - "kms:GenerateRandom"
+              - "kms:TagResource"
+              - "kms:Create*"
+              - "kms:List*"
+              - "kms:Enable*"
+              - "kms:Describe*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:CancelKeyDeletion"
+              - "kms:ImportKeyMaterial"
+              - "kms:UntagResource"
+              - "kms:RetireGrant"
+              - "kms:GenerateDataKeyWithoutPlaintext"
+              - "kms:ScheduleKeyDeletion"
+            Resource: '*'
+          - Sid: Allow use of the key for creation of an encrypted volume from a snapshot
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/IRAutomation' 
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:CreateGrant"
+              - "kms:DescribeKey"
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: 
+                  - !Sub ec2.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+          - Sid: Allow use of the key for sharing of Snapshot to Security Account
+            Effect: Allow
+            Principal:
+              AWS: 
+                -  !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/IRAutomation'
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: '*'
+          - Sid: Allow attachment of persistent resources to support sharing of Snapshot to Security Account
+            Effect: Allow
+            Principal:
+              AWS: 
+                -  !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/IRAutomation'
+            Action:
+                - "kms:CreateGrant"
+                - "kms:ListGrants"
+                - "kms:RevokeGrant"
+            Resource: '*'
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+          - Sid: Allow use of the key for copy of Snapshots to the Security Account
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${pSecurityAccount}:role/SnapshotAutomationLambdaRole' 
+            Action:
+              - "kms:Decrypt"
+              - "kms:CreateGrant"
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: 
+                  - !Sub ec2.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref pSecurityAccount
+
+  rEbsSnapshotShareKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ir/ebs
+      TargetKeyId: !Ref rEbsSnapshotShareKey
+
+
+  SecurityIncidentEventTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        DisplayName: 'security-incident-response-events'
+        KmsMasterKeyId: !Ref KMSKey
+        Subscription:
+            - Endpoint:
+                Fn::GetAtt:
+                  - SlackNotificationLambdaFunction
+                  - Arn
+              Protocol: lambda
+        TopicName: !Ref SecurityIncidentSNSTopicName
+
+
+  KMSKey:
+      Type: "AWS::KMS::Key"
+      Properties:
+        Description: "KMS key used for the security incident response SNS topic"
+        EnableKeyRotation: true
+        MultiRegion: false
+        KeyPolicy:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: "Enable Permissions for KMS Key usage"
+              Effect: "Allow"
+              Principal:
+                AWS:
+                  - !GetAtt IAMRoleForIsolationLambdaFunction.Arn
+              Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+              Resource: "*"
+            - Sid: "Enable KMS key management by the root account"
+              Effect: Allow
+              Action: kms:*
+              Resource: "*"
+              Principal:
+                AWS: !Join [ "", [ "arn:aws:iam::", !Ref "AWS::AccountId", ":root" ] ]
+
+  IsolationLambdaLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Sub '/aws/lambda/IsolationLambda'
+  SlackNotificationLambdaLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Sub '/aws/lambda/SlackNotificationLambda'
+  
+  IAMIsolationRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        RoleName: 'IAMIsolationIAMRole'
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: "Allow"
+              Principal:
+                Service:
+                  - "ec2.amazonaws.com"
+              Action:
+                - "sts:AssumeRole"
+        Path: "/"
+        ManagedPolicyArns:
+          - "arn:aws:iam::aws:policy/AWSDenyAll"
+  
+  IAMIRRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        RoleName: 'IAMIRRole'
+        AssumeRolePolicyDocument:
+          Statement:
+              - Effect: "Allow"
+                Principal:
+                  Service:
+                    - "ec2.amazonaws.com"
+                Action:
+                  - "sts:AssumeRole"
+        Path: "/"
+        ManagedPolicyArns:
+           - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  
+  IRIsolationInstanceProfile:
+      Type: "AWS::IAM::InstanceProfile"
+      Properties:
+        InstanceProfileName: 'IRIsolationInstanceProfile'
+        Path: "/"
+        Roles:
+          - !Ref IAMIsolationRole
+
+  IRInstanceProfile:
+      Type: "AWS::IAM::InstanceProfile"
+      Properties:
+        InstanceProfileName: 'IRInstanceProfile' 
+        Path: "/"
+        Roles:
+          - !Ref IAMIRRole
+
+  IAMRoleForIsolationLambdaFunction:
+      Type: AWS::IAM::Role
+      Metadata:
+          cfn_nag:
+            rules_to_suppress:
+              - id: W11
+                reason: "Resource * acceptable for this policy due to requirement to isolate any EC2 instances."
+      Properties:
+        RoleName: 'IsolationLambdaRole'
+        AssumeRolePolicyDocument:
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        Policies:
+          -
+            PolicyName: 'IsolationLambdaPolicy'
+            PolicyDocument:
+              Statement:
+                -
+                  Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                  Resource:
+                    - '*'
+                -
+                  Effect: Allow
+                  Action:
+                    - logs:PutLogEvents
+                    - logs:GetLogEvents
+                  Resource:
+                    - Fn::Sub: "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/IsolationLambda:log-stream:*"
+                -
+                  Effect: Allow
+                  Action:
+                    - cloudwatch:DescribeAlarms
+                    - cloudwatch:GetMetricData
+                    - cloudwatch:GetMetricStatistics
+                    - cloudwatch:ListMetrics
+                    - cloudwatch:PutMetricAlarm
+                    - cloudwatch:PutMetricData
+                    - cloudwatch:PutDashboard
+                    - cloudwatch:GetDashboard
+                    - cloudwatch:EnableAlarmActions
+                  Resource:
+                    - !Join
+                        - ''
+                        - -  Fn::Sub: "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule:/"
+                          -  !Ref CWRuleName
+                -
+                  Effect: Allow
+                  Action:
+                    - ec2:DescribeInstances
+                    - ec2:CreateSecurityGroup
+                    - ec2:RevokeSecurityGroupEgress
+                    - ec2:ModifyInstanceAttribute
+                    - ec2:DescribeSecurityGroups
+                    - ec2:DescribeIamInstanceProfileAssociations
+                    - ec2:AssociateIamInstanceProfile
+                    - ec2:DisassociateIamInstanceProfile
+                    - ec2:DescribeSnapshots
+                    - ec2:CreateTags
+                    - ec2:DescribeTags
+                    - ec2:DescribeVolumeAttribute
+                    - ec2:DescribeVolumeStatus
+                    - ec2:DescribeVolumes
+                    - ec2:CreateSnapshot
+                    - ec2:CreateSnapshots
+                  Resource:
+                    - '*'
+                -
+                  Effect: Allow
+                  Action:
+                    - iam:PassRole
+                  Resource:
+                    - !GetAtt
+                      - IAMIsolationRole
+                      - Arn
+                    - !GetAtt
+                      - IAMIRRole
+                      - Arn
+                -
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource:
+                    - Fn::Sub: "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SecurityIncidentSNSTopicName}"
+                    - !Ref SecurityAccountIncidentSNSTopicArn
+                - 
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey*
+                  Resource: "*"
+
+
+
+  IAMRoleForSlackNotification:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: 'SlackNotificationLambdaRole' 
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        Policies:
+          - PolicyName:  'SlackNotificationLambdaPolicy' 
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                  Resource:
+                    - '*'
+                - Effect: Allow
+                  Action:
+                    - logs:PutLogEvents
+                  Resource:
+                    - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/SlackNotificationLambda:log-stream:*"
+
+  # Lambda Function for Isolation
+  IsolationLambdaFunction:
+      Type: "AWS::Lambda::Function"
+      Properties:
+        MemorySize: 256
+        ReservedConcurrentExecutions: 30
+        FunctionName: 'IsolationLambda'
+        Handler: "index.lambda_handler" # <python_file_name>.<Function_Name>
+        Environment:
+          Variables:
+            SG_NAME: !Ref SGNAME
+            SG_DESCRIPTION: !Ref SGDESCRIPTION
+            IAMIsolationRole: !GetAtt
+              - IRIsolationInstanceProfile
+              - Arn
+            IAMIRRole: !GetAtt
+              - IRInstanceProfile
+              - Arn
+        Role:
+          Fn::GetAtt:
+            - IAMRoleForIsolationLambdaFunction
+            - Arn
+        Code:
+          ZipFile: !Sub
+          - |
+            # coding=utf-8
+            import boto3
+            import os
+            import json
+
+            ec2_client = boto3.client('ec2')
+            account_id = boto3.client('sts').get_caller_identity().get('Account')
+            sns_client = boto3.client('sns')
+            current_iam_role_arn = 'Unknown'
+            runtime_region = os.environ['AWS_REGION']
+            ec2_isolation_role = os.environ['IAMIsolationRole']
+            ec2_ir_role = os.environ['IAMIRRole']
+
+            def set_iam_role_arn(arn):
+                global current_iam_role_arn
+                current_iam_role_arn = arn
+
+
+            def identify_instance_vpc_id(instance_id):
+                instance_reservations = ec2_client.describe_instances(InstanceIds=[instance_id])['Reservations']
+                for instance_reservation in instance_reservations:
+                    instances_description = instance_reservation['Instances']
+                    for instance in instances_description:
+                        return instance['VpcId']
+
+
+            def modify_instance_attribute(instance_id, security_group_id):
+                response = ec2_client.modify_instance_attribute(
+                    Groups=[security_group_id],
+                    InstanceId=instance_id)
+                return response
+
+
+            def distribute_message(message):
+                message = f"[straight-jacket][{account_id}][{current_iam_role_arn}] {message}"
+                # Send to SNS and also publish on CloudWatch
+                sns_client.publish(TopicArn='${SecurityIncidentEventTopic}', Message=message)
+                print(message)
+
+
+            def create_security_group(group_name, description_string, vpc_id):
+                resource = boto3.resource('ec2')
+                security_group_id = resource.create_security_group(GroupName=group_name, Description=description_string,
+                                                                   VpcId=vpc_id)
+                security_group_id.revoke_egress(IpPermissions=[
+                    {'IpProtocol': '-1', 'IpRanges': [{'CidrIp': '0.0.0.0/0'}], 'Ipv6Ranges': [], 'PrefixListIds': [],
+                     'UserIdGroupPairs': []}])
+                return security_group_id.id
+
+
+            def set_instance_termination_protection(instance_id):
+                distribute_message(f"Setting termination protection for instance {instance_id}")
+                try:
+                    response = ec2_client.modify_instance_attribute(
+                        InstanceId=instance_id,
+                        DisableApiTermination={
+                            'Value': True
+                        }
+                    )
+                    message = f"Termination protection successfully enabled for instance {instance_id}"
+                except ValueError as e:
+                    message = f"Unable to set Termination protection for instance {instance_id}: {str(e['ErrorMessage'])}"
+                distribute_message(message)
+
+
+            def isolate_instance(instance_id, security_group_name, security_group_description, vpc_id):
+                try:
+                    security_groups_in_vpc = ec2_client.describe_security_groups(
+                        Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]},
+                                 {'Name': 'group-name', 'Values': [security_group_name]}])['SecurityGroups']
+                    if security_groups_in_vpc:
+                        security_group_id = security_groups_in_vpc[0]['GroupId']
+                    else:
+                        security_group_id = create_security_group(security_group_name, security_group_description, vpc_id)
+                    distribute_message(
+                        f'Modifying Instance {instance_id} with Incident Response Isolation Security Group: {security_group_id}')
+                    modify_instance_attribute(instance_id, security_group_id)
+                except Exception as e:
+                    raise e
+
+
+            def send_to_security_account(instance_id):
+                message = {"account": account_id,"instance_id": instance_id,'region':runtime_region}
+                sns_client = boto3.client('sns')
+                sns_client.publish(TopicArn='${SecurityAccountIncidentSNSTopicArn}',
+                                   Message=json.dumps({'default': json.dumps(message)}), MessageStructure='json')
+
+
+            def disassociate_iam_instance_profile(instance_id):
+              iam_instance_profile_associations = ec2_client.describe_iam_instance_profile_associations(
+                                    Filters=[{'Name': 'instance-id', 'Values': [instance_id]}])['IamInstanceProfileAssociations']
+              if len(iam_instance_profile_associations) > 0:
+                                      for associated_iam_role in iam_instance_profile_associations:
+                                          association_id = associated_iam_role['AssociationId']
+                                          iam_instance_profile_arn = associated_iam_role['IamInstanceProfile']['Arn']
+                                          set_iam_role_arn(iam_instance_profile_arn)
+                                          distribute_message(f'Current IAM Instance Profile:  {iam_instance_profile_arn}')
+                                          ec2_client.disassociate_iam_instance_profile(AssociationId=association_id)
+                                          distribute_message(f'Disassociated IAM Role from {instance_id}')
+
+
+            def lambda_handler(event, context):
+                tags = event['detail']['tags']
+                tag_key = "SecurityIncidentStatus"
+                tag_values = ["Analyze","Contain"]
+
+                security_group_name = os.environ['SG_NAME']
+                security_group_description = os.environ['SG_DESCRIPTION']
+                instance_id = event['resources'][0].split("/")[1]
+                changed_keys = event['detail']['changed-tag-keys']
+                if tag_key in changed_keys:
+                    for key in tags:
+                        if key == tag_key:
+                            if tags[key] == "Analyze":
+                                # Termination protection
+                                set_instance_termination_protection(instance_id)
+                                send_to_security_account(instance_id)
+                                disassociate_iam_instance_profile(instance_id)
+                                ec2_client.associate_iam_instance_profile(IamInstanceProfile={'Arn': ec2_ir_role },
+                                                                          InstanceId=instance_id)
+                                
+                            elif tags[key] == "Contain":    
+                                #Isolate the instance
+                                disassociate_iam_instance_profile(instance_id)
+                                ec2_client.associate_iam_instance_profile(IamInstanceProfile={'Arn': ec2_isolation_role },
+                                                                          InstanceId=instance_id)
+                                vpc_id = identify_instance_vpc_id(instance_id)
+                                isolate_instance(instance_id, security_group_name, security_group_description, vpc_id)
+                            else:
+                                distribute_message(
+                                    f"Incident Tag for Resource {instance_id}, changed to: {tags[key]} - Automation will not be triggered since Key Value does not match the configured incident value (Case-Sensitive)")
+
+          - TopicARN: !Ref SecurityIncidentEventTopic
+        Runtime: "python3.7"
+        Timeout: 180
+  # Lambda Function for Notification
+  SlackNotificationLambdaFunction:
+      Type: "AWS::Lambda::Function"
+      Properties:
+        MemorySize: 128
+        FunctionName: 'SlackNotificationLambda'
+        Handler: "index.lambda_handler" # <python_file_name>.<Function_Name>
+        Role:
+          Fn::GetAtt:
+            - IAMRoleForSlackNotification
+            - Arn
+        Code:
+          ZipFile: !Sub
+           -  |
+              # coding=utf-8
+              import urllib3
+              import json
+
+              http = urllib3.PoolManager()
+
+
+              def lambda_handler(event, context):
+                  url = "${SlackURL}"
+                  msg = {
+                      "channel": "${SlackChannel}",
+                      "as_user": False,
+                      "text": event['Records'][0]['Sns']['Message']
+                  }
+
+                  encoded_msg = json.dumps(msg).encode('utf-8')
+                  resp = http.request('POST', url, body=encoded_msg)
+                  print({
+                      "message": event['Records'][0]['Sns']['Message'],
+                      "status_code": resp.status,
+                      "response": resp.data
+                  })
+           - SlackURL: !Ref SlackURL
+             SlackChannel: !Ref SlackChannel
+        Runtime: "python3.7"
+        Timeout: 180
+
+  # Create CloudWatch Event Rule to trigger Lambda for Remediation.
+  EC2TagChangeEvent:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: !Ref CWRuleName
+        Description: "CloudWatch Event Rule to trigger Lambda"
+        EventPattern:
+          source:
+            - "aws.tag"
+          detail:
+            service:
+              - ec2
+            resource-type:
+              - instance
+        State: "ENABLED"
+        Targets:
+          -
+            Arn: !GetAtt
+              - IsolationLambdaFunction
+              - Arn
+            Id: "EC2TagChangeEvent-Lambda-Trigger"
+
+  IsolationLambdaFunctionInvokePermissions:
+      DependsOn:
+        - IsolationLambdaFunction
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName: !Ref "IsolationLambdaFunction"
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+
+Outputs:
+  IsolationLambdaFunction:
+    Value: !GetAtt IsolationLambdaFunction.Arn
+  IAMIsolationProfile:
+    Value: !GetAtt IRIsolationInstanceProfile.Arn
+  IRInstanceProfile:
+    Value: !GetAtt IRInstanceProfile.Arn
+  SlackNotificationLambdaFunction:
+    Value: !GetAtt SlackNotificationLambdaFunction.Arn

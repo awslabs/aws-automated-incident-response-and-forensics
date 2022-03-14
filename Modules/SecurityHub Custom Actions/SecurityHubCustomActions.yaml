@@ -1,0 +1,253 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+AWSTemplateFormatVersion: 2010-09-09
+Transform: "AWS::Serverless-2016-10-31"
+Description: This template deploys the SecurityHub Custom Actions. Note that having deployed the main solution is a pre-requisite.
+
+
+
+Resources:
+  CreateActionTargetLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateActionTarget
+      Description: Custom resource to create an action target in Security Hub
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt CreateActionTargetLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def parse_arn(arn):
+              arn_split = arn.split(':')
+              account = arn_split[4]
+              instance = arn_split[5].split('/')[1]
+              return (account,instance)
+
+          def parse_event(event):
+              account_instance_tuples = list()
+              findings = event['detail']['findings']
+              for finding in findings:
+                  region = finding['Region']
+                  for resource in finding['Resources']:
+                      parsed_arn = parse_arn(resource['Id'])
+                      tuple = (parsed_arn[0],parsed_arn[1],region)
+                      account_instance_tuples.append(tuple)
+              return account_instance_tuples
+
+
+          def lambda_handler(event, context):
+              try:
+                  account_instance_tuples = parse_event(event)
+                  for tuple in account_instance_tuples:
+                      client = boto3.client('sts')
+                      response = client.assume_role(
+                          RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                              os.environ.get("Partition", 'aws'),
+                              tuple[0]
+                          ),
+                          RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                      )
+
+                      session = boto3.Session(
+                          aws_access_key_id=response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                          aws_session_token=response['Credentials']['SessionToken']
+                      )
+
+                      client = session.client('ec2', region_name=tuple[2])
+                      client.create_tags(
+                          DryRun=False,
+                          Resources=[
+                              tuple[1],                ],
+                          Tags=[
+                              {
+                                  'Key': 'SecurityIncidentStatus',
+                                  'Value': 'Analyze'
+                              },
+                          ]
+                      )
+
+              except Exception as e:
+                 print("error" + str(e))
+              return {
+                  "Output": event
+
+              }
+
+  CreateActionTargetLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Policies:
+          - PolicyName: CreateActionTarget-LambdaPolicy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cloudwatch:PutMetricData
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - securityhub:CreateActionTarget
+                    - securityhub:DeleteActionTarget
+                  Resource: '*'
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal: { Service: lambda.amazonaws.com }
+              Action:
+                - sts:AssumeRole
+  rSecurityHubCustomActionLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SecurityHubCustomActionLambdaRole
+      Path: /
+      Policies:
+        - PolicyName: SecurityHubCustomActionLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "sts:AssumeRole"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::*:role/IRAutomation"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+
+  rSecurityHubCustomActionAnalyzeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  print(event)
+                  client = boto3.client('sts')
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+
+                  client = session.client('ec2', region_name=event['Region'])
+                  client.create_tags(
+                      DryRun=False,
+                      Resources=[
+                          event['InstanceId'],
+                      ],
+                      Tags=[
+                          {
+                              'Key': 'SecurityIncidentStatus',
+                              'Value': 'Analyze'
+                          },
+                      ]
+                  )
+
+              except Exception as e:
+                 print("error" + str(e))
+              return {
+                  "Output": event
+
+              }
+      Role: !GetAtt rSecurityHubCustomActionLambdaRole.Arn
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+
+  rSecurityHubCustomActionResourcePolicy:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: "rSecurityHubCustomActionAnalyzeLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rSHAnalyzeEventRule.Arn
+
+  rAnalyzeActionTarget:
+    Type: Custom::ActionTarget
+    Version: 1.0
+    Properties:
+      ServiceToken: !GetAtt CreateActionTargetLambdaFunction.Arn
+      Name: Isolate EC2 Instance
+      Description: Isolates  the EC2 instance
+      Id: SHResponseIsolate
+
+  rSHAnalyzeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecurityHub_Analyze_Instance
+      Description: "Triggers the analysis workflow."
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Custom Action
+        resources:
+          - !GetAtt rAnalyzeActionTarget.Arn
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt rSecurityHubCustomActionAnalyzeLambda.Arn
+          Id: "SHResponseAnalyze"

@@ -1,0 +1,4218 @@
+ # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ # SPDX-License-Identifier: MIT-0
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy of this
+ # software and associated documentation files (the "Software"), to deal in the Software
+ # without restriction, including without limitation the rights to use, copy, modify,
+ # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+ # permit persons to whom the Software is furnished to do so.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ # PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ # HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Transform: "AWS::Serverless-2016-10-31"
+Description: This template deploys step functions which enable Disk and Memory Acquisition WorkFlow
+Parameters:
+  pAvailabilityZone:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Description: Availability Zone to Launch EC2 instance
+    
+  pAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+    Description: Amazon Linux AMI for DD Copy - Don't change.
+  
+  pIRArtifactBucket:
+    Type: String
+    Description: Name of the Forensic Account S3 IR Artifacts Bucket
+
+  pOrgId:
+    Type: String
+    Description: Organization ID to which the target accounts belong
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+    MaxLength: 34
+    MinLength: 12
+    ConstraintDescription: Organization ID string requires "o-" followed by from 10 to 32 lowercase letters or digits.
+
+  pSecurtiyAccount:
+    Type: String
+    Description: AWS Account Number of the Security Account where snapshot processing occurs
+    AllowedPattern: "[0-9]*"
+    MaxLength: 12
+    MinLength: 12
+    ConstraintDescription: account number must contain only numbers.
+
+
+Resources:
+  rLambdaTriggerIRStepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+          StepFunction: !GetAtt rForensicsStateMachineDiskAndMemory.Arn
+          
+      Code:
+        ZipFile: |
+              import json,time
+              import boto3
+              import os
+              client = boto3.client('stepfunctions')
+              stepfunction = os.environ['StepFunction']
+              
+              def generate_case_id(account,instance_id,region):
+                  epoch_time = str(int(time.time()))
+                  case_id = '-'.join([account,instance_id,region,epoch_time])
+                  return case_id
+
+              def trigger_stepfunction(case_id, account, instance_id,region):
+                  step_function_request = {   "CaseId": case_id,
+                                              "InstanceId": instance_id,
+                                              "Account": account,
+                                              "Region": region,
+                                              "RetainArtefacts": "true"
+                                          }
+                  input = json.dumps(step_function_request)
+                  response = client.start_execution(
+                      stateMachineArn=stepfunction,
+                      name='sf-forensics-'+case_id,
+                      input=input
+                  )
+                  print(response)
+
+
+              def lambda_handler(event, context):
+                  msg = json.loads(event['Records'][0]['Sns']['Message'])
+                  account = msg['account']
+                  instance_id = msg['instance_id']
+                  region = msg['region']
+                  case_id = generate_case_id(account, instance_id, region)
+                  trigger_stepfunction(case_id , account, instance_id, region)
+      Role: !GetAtt rSNSLambdaRole.Arn 
+      FunctionName: LambdaTriggerIRStepFunction
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Trigger the statemachine to perform IR
+
+  rSNSInvokeLambdaPermissions:
+      DependsOn:
+        - rLambdaTriggerIRStepFunction
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName: !Ref "rLambdaTriggerIRStepFunction"
+        Action: "lambda:InvokeFunction"
+        Principal: "sns.amazonaws.com"
+        SourceArn: !Ref rSecurityIncidentEventTopic
+
+  rSNSLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SNSSecurityEventLambdaRole
+      Path: /
+      Policies:
+
+        - PolicyName: SNSSecurityEventLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                 - "states:StartExecution"
+                Resource: !GetAtt rForensicsStateMachineDiskAndMemory.Arn
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+
+  rSNSKMSKey:
+    Type: "AWS::KMS::Key"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F76
+            reason: "This is still ok considering it's constrained by the condition key on the organization principal."
+    Properties:
+      Description: "KMS key used for the security incident response SNS topic"
+      EnableKeyRotation: true
+      MultiRegion: false
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Enable Permissions for KMS Key usage"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !GetAtt rSNSLambdaRole.Arn
+            Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+            Resource: "*"
+          - Sid: "Enable KMS key management by the root account"
+            Effect: Allow
+            Action: kms:*
+            Resource: "*"
+            Principal:
+              AWS: !Join [ "", [ "arn:aws:iam::", !Ref "AWS::AccountId", ":root" ] ]
+          - Sid: "Enable KMS key access by the external account"
+            Effect: "Allow"
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+
+  rSecurityIncidentEventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'security-incident-response-events'
+      KmsMasterKeyId: !Ref rSNSKMSKey
+      Subscription:
+          - Endpoint:
+              Fn::GetAtt:
+                - rLambdaTriggerIRStepFunction
+                - Arn
+            Protocol: lambda
+      TopicName: 'security-incident-response-events'
+
+
+  rSecurityIncidentEventTopicPolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: "This is still ok considering it's constrained by the condition key on the organization principal."
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: AllowServices
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - 'sns:Publish'
+            Resource:
+              - !Ref rSecurityIncidentEventTopic
+          - Sid: AllowAWSPublish
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: 'sns:Publish'
+            Resource:
+              - !Ref rSecurityIncidentEventTopic
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+      Topics:
+        - !Ref rSecurityIncidentEventTopic
+
+  rSnapshotKey:
+    Type: AWS::KMS::Key
+    DependsOn: rLambdaRole
+    Properties:
+      Description: Snapshot Automation KMS key for EBS Snapshots and Volumes in Security Account
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - "kms:GenerateRandom"
+              - "kms:TagResource"
+              - "kms:Create*"
+              - "kms:List*"
+              - "kms:Enable*"
+              - "kms:Describe*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:CancelKeyDeletion"
+              - "kms:ImportKeyMaterial"
+              - "kms:UntagResource"
+              - "kms:RetireGrant"
+              - "kms:GenerateDataKeyWithoutPlaintext"
+              - "kms:ScheduleKeyDeletion"
+            Resource: "*"
+          - Sid: Allow use of the key for copy snapshot
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationLambdaRole"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:CreateGrant"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: 
+                  - !Sub ec2.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+          - Sid: Allow use of the key for creation of a volume from snapshot
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationLambdaRole"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          - Sid: Allow attachment of persistent resources to support creation of a volume from snapshot
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationLambdaRole"
+            Action:
+                - "kms:CreateGrant"
+                - "kms:ListGrants"
+                - "kms:RevokeGrant"
+            Resource: "*"
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+  
+  rSecIRKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ir/sec
+      TargetKeyId: !Ref rSnapshotKey
+
+  rLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SnapshotAutomationLambdaRole
+      Path: /
+      Policies:
+        - PolicyName: SnapshotAutomation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "sts:AssumeRole"
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:iam::*:role/IRAutomation"
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateVolume"
+                  - "ec2:CreateSnapshot"
+                  - "ec2:AttachVolume"
+                  - "ec2:DetachVolume"
+                  - "ec2:CreateTags"
+                  - "ec2:DescribeVolumes"
+                  - "ec2:DescribeVolumeStatus"
+                  - "ec2:DescribeVolumeAttribute"
+                  - "ec2:DescribeVolumesModifications"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeSnapshots"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeVpcs"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeTags"
+                  - "ec2:CopySnapshot"
+                  - "ec2:RunInstances"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ec2:TerminateInstances"
+                  - "ec2:DeleteVolume"
+                  - "ec2:DeleteSnapshot"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ir-acquisition: "True"
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: !GetAtt rS3CopyRole.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:PutObjectAcl"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:CreateGrant"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:SendCommand"
+                  - "ssm:GetCommandInvocation"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "sqs:SendMessage"
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+  
+  rKmsPolicy:
+    Type: "AWS::IAM::Policy"
+    DependsOn: rSnapshotKey
+    Properties:
+      PolicyName: CFNUsers
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt*"
+              - "kms:DescribeKey"
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrant"
+              - "kms:GenerateDataKey*"
+            Resource: !GetAtt rSnapshotKey.Arn
+      Roles:
+        - !Ref rLambdaRole
+              
+  rS3CopyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: S3CopyInstanceProfile
+      Path: /
+      Roles: 
+        - !Ref rS3CopyRole
+
+  #used by instance to copy dd output to s3
+  rS3CopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SnapshotAutomationS3Copy
+      MaxSessionDuration: 43200
+      Path: /
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 
+      Policies:
+        - PolicyName: CopySnapshotToS3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:CreateMultipartUpload"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"                  
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:HeadObject"
+                Resource: #was: #!Sub "arn:${AWS::Partition}:s3:::${pIRBunkerBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+
+  rCreateSnapshotFromInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+
+          def lambda_handler(event, context):
+              try:
+                  if not isinstance(event['InstanceId'], list):
+                      event['InstanceId'] = [event['InstanceId']]
+                  
+                  client = boto3.client('sts')
+
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ec2 = session.client('ec2', region_name=event['Region'])
+                        
+                  print(f"Case {event['CaseId']} - Received request to create snapshot for instance {','.join(event['InstanceId'])} in region {event['Region']}")
+                  
+                  response = ec2.describe_instances(
+                      InstanceIds=event['InstanceId']
+                  )
+
+                  output = {}
+                  
+                  for res in response['Reservations']:
+                      for i in res['Instances']:
+                          for vol in i['BlockDeviceMappings']:
+                              if not vol['Ebs']['Status'] == 'detached':
+                                  # create snapshot
+                                  print(f"Creating a snapshot for volume {vol['Ebs']['VolumeId']} on instance {i['InstanceId']} in region {event['Region']}")
+                                  
+                                  snap = ec2.create_snapshot(
+                                      Description="Automated Snapshot creation: {}".format(i['InstanceId']),
+                                      VolumeId=vol['Ebs']['VolumeId'],
+                                      TagSpecifications=[
+                                          {
+                                              'ResourceType': 'snapshot',
+                                              'Tags': [
+                                                  {
+                                                      'Key': 'ir-acquisition',
+                                                      'Value': 'True'
+                                                  },
+                                                  {
+                                                      "Key": "case-id",
+                                                      "Value": event['CaseId']
+                                                  }
+                                              ]
+                                          },
+                                      ]
+                                  )
+                                  
+                                  output.setdefault(i['InstanceId'], {})[vol['Ebs']['VolumeId']] = snap['SnapshotId']
+                  
+                  azs = {}
+
+                  for res in response['Reservations']:
+                      for i in res['Instances']:
+                          azs.setdefault(i['InstanceId'], {})['AvailabilityZone'] = i['Placement']['AvailabilityZone']
+                                              
+                  return {
+                      "Output": output,
+                      "AvailabilityZones": azs        
+                  }
+                  
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  # Create a JSON string
+                  raise CustomException(api_exception_obj)
+                  
+
+          class CustomException(Exception):
+              pass
+              
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateSnapshotsFromInstance
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Creation Lambda for Disk Acquisition Step Function
+
+  rCheckSnapshotStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                      
+                  snapshots = []
+                  
+                  for i, v in event['CreateSnapshots']['Output'].items():
+                      for vol, snap in v.items():
+                          snapshots.append(snap)
+                  
+                  client = boto3.client('sts')
+                  
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ec2 = session.client('ec2', region_name=event['Region'])
+                  
+                  if not isinstance(snapshots, list):
+                      snapshots = [snapshots]
+                      
+                  print("Checking Status for snapshots {} in region {}".format(
+                      ','.join(snapshots),
+                      event['Region']
+                  ))
+                  
+                  response = ec2.describe_snapshots(
+                      SnapshotIds=snapshots
+                  )
+                  
+                  statuses = [x['State'] for x in response['Snapshots']]
+                  
+                  if 'pending' in statuses or 'error' in statuses:
+                      raise Exception("Snapshots not finished")
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  # Create a JSON string
+                  if (exception_message == "Snapshots not finished"):
+                      raise WaitException(api_exception_obj)
+                  else:
+                      raise GeneralException(api_exception_obj)
+                  
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckSnapshotStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Creation Status Lambda for Step Function
+
+  rCopySnapshotSharing:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          MasterRegion: !Ref "AWS::Region"
+          SecurityAccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+          import time
+
+
+          def lambda_handler(event, context):
+              try:
+                  security_account_id = os.environ.get("SecurityAccountId")
+                        
+                  client = boto3.client('sts')
+                      
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ec2 = session.client('ec2', region_name=os.environ.get("MasterRegion"))
+                                      
+                  output = {}
+                  
+                  for i, v in event['CreateSnapshots']['Output'].items():
+                      for vol, snap in v.items():
+                      
+                          print(f"Case {event['CaseId']} - Copying snapshot {snap} in source region {event['Region']} to master region {os.environ.get('MasterRegion')}")
+
+                          copy_snap = ec2.copy_snapshot(
+                              Description="Automated Snapshot creation - Re-encryption and Sharing: {}".format(i),
+                              Encrypted=True,
+                              KmsKeyId='alias/ir/ebs',
+                              SourceRegion=event['Region'],
+                              SourceSnapshotId=snap,
+                              TagSpecifications=[
+                                  {
+                                      'ResourceType': 'snapshot',
+                                      'Tags': [
+                                          {
+                                              'Key': 'ir-acquisition',
+                                              'Value': "True"
+                                          },
+                                          {
+                                              'Key': 'case-id',
+                                              'Value': event['CaseId']
+                                          }
+                                      ]
+                                  },
+                              ]
+                          )
+                          
+                          print(f"Case {event['CaseId']} - Sharing snapshot {copy_snap['SnapshotId']} with Security Account {security_account_id}")
+
+                          share = ec2.modify_snapshot_attribute(
+                              Attribute='createVolumePermission',
+                              OperationType='add',
+                              SnapshotId=copy_snap['SnapshotId'],
+                              UserIds=[
+                                  security_account_id
+                              ]
+                          )
+                          
+                          time.sleep(1)
+                          
+                          output.setdefault(i, {})[vol] = copy_snap['SnapshotId']   
+                                              
+                  return {
+                      "Output": output
+                  }
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CopyAndShareSnapshots
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Creation Lambda for Disk Acquisition Step Function
+
+  rCheckSnapshotCopySharingStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                      
+                  snapshots = []
+                  
+                  for i, v in event['CopySnapshotsSharing']['Output'].items():
+                      for vol, snap in v.items():
+                          snapshots.append(snap)
+                  
+                  client = boto3.client('sts')
+                          
+                  ec2 = boto3.client('ec2', region_name=os.environ.get("MasterRegion"))
+                  
+                    
+                  print("Checking Status for snapshots {} in region {}".format(
+                      ','.join(snapshots),
+                      os.environ.get("MasterRegion")
+                  ))
+                  
+                  response = ec2.describe_snapshots(
+                      SnapshotIds=snapshots
+                  )
+                  
+                  statuses = [x['State'] for x in response['Snapshots']]
+                  
+                  if 'pending' in statuses or 'error' in statuses:
+                      raise Exception("Snapshots not finished")
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  # Create a JSON string
+                  if (exception_message == "Snapshots not finished"):
+                      raise WaitException(api_exception_obj)
+                  else:
+                      raise GeneralException(api_exception_obj)
+                  
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckSnapshotCopySharingStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Copy Status Lambda for Step Function
+
+  rCopySnapshotsToSecurity:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                  #selecting master region as 
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                                      
+                  output = {}
+
+                  for i, v in event['CopySnapshotsSharing']['Output'].items():
+                      for vol, snap in v.items():
+                          #do copy snapshots operation
+                          
+                          print(f"Case {event['CaseId']} - Copying source snapshot {snap} from account {event['Account']} to Security Account {os.environ.get('AccountId')}")
+
+                          copy_snap = ec2.copy_snapshot(
+                              Description=f"Forensics Acquisition - Source Account: {event['Account']} (Instance: {i})",
+                              Encrypted=True,
+                              KmsKeyId='alias/ir/sec',
+                              SourceRegion=os.environ.get('MasterRegion'),
+                              SourceSnapshotId=snap,
+                              TagSpecifications=[
+                                  {
+                                      'ResourceType': 'snapshot',
+                                      'Tags': [
+                                          {
+                                              'Key': 'ir-acquisition',
+                                              'Value': "True"
+                                          },
+                                          {
+                                              'Key': 'case-id',
+                                              'Value': event['CaseId']
+                                          }
+                                      ]
+                                  },
+                              ]
+                          )
+
+
+                          output.setdefault(i, {}).setdefault("SnapshotIds", []).append(copy_snap.get('SnapshotId'))
+                                                
+                  return {
+                      "Output": output
+                  }
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CopySnapshots
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Creation Lambda for Disk Acquisition Step Function
+
+  rCheckSnapshotCopyStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                      
+                  snapshots = []
+                  
+                  for i, v in event['CopySnapshots']['Output'].items():
+                      for snap in v.get('SnapshotIds'):
+                          snapshots.append(snap)
+                  
+                  client = boto3.client('sts')
+                          
+                  ec2 = boto3.client('ec2', region_name=event['Region'])
+                  
+                    
+                  print("Checking Status for snapshots {} in region {}".format(
+                      ','.join(snapshots),
+                      event['Region']
+                  ))
+                  
+                  response = ec2.describe_snapshots(
+                      SnapshotIds=snapshots
+                  )
+                  
+                  statuses = [x['State'] for x in response['Snapshots']]
+                  
+                  if 'pending' in statuses or 'error' in statuses:
+                      raise Exception("Snapshots not finished")
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  # Create a JSON string
+                  if (exception_message == "Snapshots not finished"):
+                      raise WaitException(api_exception_obj)
+                  else:
+                      raise GeneralException(api_exception_obj)
+                  
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckSnapshotCopyStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Copy Status Lambda for Step Function
+
+  rCreateVolumesDD:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+          AvailabilityZone: !Ref pAvailabilityZone
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                                      
+                  output = {}
+
+                  for i, v in event['CopySnapshots']['Output'].items():
+                      for snapshot in v.get('SnapshotIds'):
+                          vol_size = ec2.describe_snapshots(
+                              SnapshotIds=[snapshot]
+                          )['Snapshots'][0]['VolumeSize']
+
+                          new_vol_size = 50 * vol_size
+                          if new_vol_size > 64000:
+                              # Cater for maximum Iops on io1 volumes
+                              new_vol_size = 64000
+                          
+                          print(f"Case {event['CaseId']} - Creating new volume from snapshot {snapshot} for dd operation")
+
+                          response = ec2.create_volume(
+                              AvailabilityZone=os.environ.get('AvailabilityZone'),
+                              SnapshotId=snapshot,
+                              KmsKeyId='alias/ir/sec',
+                              Encrypted=True,
+                              VolumeType='io1',
+                              Iops=new_vol_size,
+                              TagSpecifications=[
+                                  {
+                                      "ResourceType": "volume",
+                                      "Tags": [
+                                          {
+                                              'Key': 'ir-acquisition',
+                                              'Value': 'True'
+                                          },
+                                          {
+                                              "Key": "case-id",
+                                              "Value": event['CaseId']
+                                          }
+                                      ]
+                                  }
+                              ]
+                          )
+                          
+                          output.setdefault(
+                              i,
+                              {}
+                          )[snapshot] = response['VolumeId']
+                                              
+                  return {
+                      "Output": output
+                  }
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: VolumeCreationForDd
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Volume Creation for Snapshot Automation Step Function
+
+  rCheckVolumeDDStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  volumes = []
+                  
+                  for i, v in event['CreateVolumesDD']['Output'].items():
+                      for snap, vol in v.items():
+                          volumes.append(vol)                       
+                      
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                      
+                  print("Checking Status on volumes {} in region {}".format(
+                      ','.join(volumes),
+                      event['Region']
+                  ))
+                  
+                  response = ec2.describe_volumes(
+                      VolumeIds=volumes
+                  )
+                  
+                  statuses = [x['State'] for x in response['Volumes']]
+                  
+                  for i in ['creating','deleting','deleted','error']:
+                      if i in statuses:
+                          raise Exception("Volumes not finished yet")                 
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  # Create a JSON string
+                  if (exception_message == "Volumes not finished yet"):
+                      raise WaitException(api_exception_obj)
+                  else:
+                      raise GeneralException(api_exception_obj)
+                  
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckVolumeDDStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Check Volume Creation Status for Snapshot Automation Step Function
+
+  # Generate PreSigned URL
+  rCreateTargetUrls:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          S3Bucket: !Ref pIRArtifactBucket
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import json
+
+
+          def lambda_handler(event, context):
+              try:                                    
+                  script_files = []
+                  
+                  for i, v in event['CreateVolumesDD']['Output'].items():
+                      for snap, vol in v.items():
+                          prefix = "{0}/{1}/{2}/{3}/{3}".format(
+                              event['CaseId'],
+                              event['Account'],
+                              i,
+                              vol                 
+                          )
+                          
+                          S3root = "{0}/{1}/{2}/{3}/".format(
+                              event['CaseId'],
+                              event['Account'],
+                              i,
+                              vol
+                          )
+                          
+                          raw_url = "{}.raw.gz".format(
+                              prefix
+                          )
+                          
+                          md5_url = "{}.raw.md5".format(
+                              prefix
+                          )
+                          
+                          sha256_url = "{}.raw.sha256".format(
+                              prefix
+                          )
+                          
+                          script_files.append({
+                              "raw": "s3://{}/{}".format(os.environ.get("S3Bucket"), raw_url),
+                              "md5": "s3://{}/{}".format(os.environ.get("S3Bucket"), md5_url),
+                              "sha": "s3://{}/{}".format(os.environ.get("S3Bucket"), sha256_url),
+                              "vol": vol,
+                              "prefix": prefix,
+                              "ArtifactRoot": "s3://{}/{}".format(os.environ.get("S3Bucket"), S3root),
+                              "OriginalVol": vol
+                          })
+                                              
+                  return {
+                      "Output": script_files
+                  }
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateTargetUrls
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Create raw volume copies and upload to S3
+  
+  rGetLocationData:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                  
+                  #expecting an existing VPC with name tag ir-vpc.
+                  vpc_ids = ec2.describe_vpcs(
+                      Filters=[
+                              {
+                                  'Name': 'tag:Name',
+                                  'Values': [
+                                      'ir-vpc',
+                                  ]
+                              },
+                          ]
+                  )
+                  vpcId = vpc_ids['Vpcs'][0]['VpcId']
+
+                  security_group = ec2.describe_security_groups(
+                      Filters=[
+                              {
+                                  'Name': 'group-name',
+                                  'Values': [
+                                      'ir-instance-sg',
+                                  ]
+                              },
+                          ]
+                  )       
+                  
+                  securtiy_group_id = security_group["SecurityGroups"][0]["GroupId"]
+
+                  #expecting an existing Subnet with name tag ir-subnet.
+                  subnets = ec2.describe_subnets(
+                      Filters=[
+                          {
+                              'Name': 'tag:Name',
+                              'Values': [
+                                  'ir-subnet',
+                              ]
+                          },
+                          {
+                              "Name": "vpc-id",
+                              "Values": [vpcId]
+                          }
+                      ]
+                  )
+                  
+                  subnet_id = subnets['Subnets'][0]['SubnetId']
+                  
+                  return {
+                      "subnetId": subnet_id,
+                      "groupId": securtiy_group_id
+                  }    
+                  
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: GetLocationData
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Get EC2 Placement data Lambda for Step Function
+  
+  rRunInstancesForDd:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          AmiId: !Ref pAmiId
+          MasterRegion: !Ref "AWS::Region"
+          AvailabilityZone: !Ref pAvailabilityZone          
+          S3CopyRole: !GetAtt rS3CopyRole.Arn
+          IrKmsKey: !GetAtt rSnapshotKey.Arn
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                  
+                  instanceIds = []
+                  
+                  for signed_url in event['CreateTargetUrls']['Output']:    
+                      
+                      print(f"Case {event['CaseId']} - Running r5a.2xlarge instance for dd operation with AMI {os.environ.get('AmiId')}")
+
+                      response = ec2.run_instances(
+                          ImageId=os.environ.get("AmiId"),
+                          InstanceType='r5a.2xlarge',
+                          EbsOptimized=True,
+                          BlockDeviceMappings=[
+                              {
+                                  "DeviceName": "/dev/xvda",
+                                  "Ebs": {
+                                          "Encrypted": True,
+                                          "KmsKeyId": os.environ.get('IrKmsKey')
+                                  }
+                              }
+                          ],
+                          SecurityGroupIds=[
+                              event['GetLocationData']['groupId']
+                          ],
+                          SubnetId=event['GetLocationData']['subnetId'],
+                          MaxCount=1,
+                          MinCount=1,
+                          TagSpecifications=[
+                              {
+                                  "ResourceType": "instance",
+                                  "Tags": [
+                                      {
+                                          "Key": "Name",
+                                          "Value": f"DdCopyInstance-{event['CaseId']}"
+                                      },
+                                      {
+                                          "Key": "ir-acquisition",
+                                          "Value": "True"
+                                      },
+                                      {
+                                          "Key": "case-id",
+                                          "Value": event['CaseId']
+                                      }
+                                  ]
+                              }
+                          ],
+                          IamInstanceProfile={
+                              'Name': 'S3CopyInstanceProfile'
+                          }
+                      )
+                      
+                      instanceIds.append(response['Instances'][0]['InstanceId'])
+                                              
+                  return {
+                      "DdInstanceIds": instanceIds
+                  }
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: RunInstances
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Create raw volume copies and upload to S3
+
+  rCheckInstanceStatusCmd:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+          def lambda_handler(event, context):
+              try:
+          
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  
+                  commands = [
+                      '#!/bin/bash',
+                      'echo ready'
+                  ]
+
+                  response = ssm.send_command(
+                      InstanceIds=event['RunInstancesForDd']['DdInstanceIds'],
+                      DocumentName='AWS-RunShellScript',
+                      Parameters={
+                          'commands': commands,
+                          'executionTimeout': ['60'] 
+                      },
+                      Comment='Echo Ready'
+                  )
+                  
+                  return response['Command']['CommandId']
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckInstanceStatusCmd
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Check To see if instances are ready for processing
+
+  rCheckInstanceStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def lambda_handler(event, context):
+              try:
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  
+                  for instance in event['RunInstancesForDd']['DdInstanceIds']:
+                      results = ssm.get_command_invocation(
+                          CommandId=event['CheckInstanceStatusCmd'],
+                          InstanceId=instance
+                      )
+                      if results['StatusDetails'] == 'Failed':
+                          raise GeneralException("Command failed {}".format(results['StatusDetails']))
+                      elif not results['StatusDetails'] == 'Success':
+                          raise Exception("Job Not finished or failed {}".format(results['StatusDetails']))            
+                      elif results['StatusDetails'] == 'Success':
+                          return "Command completed successfully."
+                          
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  if exception_type == 'GeneralException':
+                      raise GeneralException(api_exception_obj)
+                  else:
+                      raise WaitException(api_exception_obj)
+
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: InstanceCommandCheck
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Check Instance Status for Processing Automation Step Function
+
+  rStartCopy:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          AmiId: !Ref pAmiId
+          S3CopyRole: !GetAtt rS3CopyRole.Arn
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+          import time
+
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+
+                  commandIds = []
+                  
+                  for index, output in enumerate(event['CreateTargetUrls']['Output']):
+                      curl = 'aws s3 cp -'
+                      sizetag = '--metadata OriginalSize=$VOLUMESIZE'
+                      acl = '--acl bucket-owner-full-control'
+                      
+                      #mount volume
+                      ec2.attach_volume(
+                          Device='/dev/xvdp',
+                          InstanceId=event['RunInstancesForDd']['DdInstanceIds'][index],
+                          VolumeId=output['vol']
+                      )
+
+                      time.sleep(10)
+
+                      commands = [
+                          "#!/bin/bash",
+                          'if [ -e /usr/bin/yum ]',
+                          'then',
+                          '  if [ `rpm -qa|grep awscli|wc -l` -eq 0 ]; then yum -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          'else',
+                          '  if [ `dpkg -l|grep awscli|wc -l` -eq 0 ]; then DEBIAN_FRONTEND=noninteractive apt-get -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          'fi',
+                          'if [ `rpm -qa|grep awscli|wc -l` -eq 0 ]; then yum -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          f"export AWS_DEFAULT_REGION={event['Region']};",
+                          "export VOLUMESIZE=`fdisk -l /dev/xvdp  | awk '$1==\"Disk\" && $2 ~ /^\/dev\/.*/ {print $3}'`",
+                          f"dd if=/dev/xvdp | tee >(gzip | {curl} {output['raw']} {sizetag} {acl}) >(md5sum | {curl} {output['md5']} {acl}) |sha256sum | {curl} {output['sha']} {acl}"
+                      ]
+                      
+                      print(f"Case {event['CaseId']} - Sending commands {commands} to instance {event['RunInstancesForDd']['DdInstanceIds'][index]}")
+                      
+                      response = ssm.send_command(
+                          InstanceIds=[event['RunInstancesForDd']['DdInstanceIds'][index]],
+                          DocumentName='AWS-RunShellScript',
+                          Parameters={
+                              'commands': commands,
+                              'executionTimeout': ['43200']
+                          },
+                          Comment='Disk Acquisition'
+                      )
+                      
+                      commandIds.append(response['Command']['CommandId'])
+                                              
+                  return commandIds
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: StartRawCopy
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Create raw volume copies and upload to S3
+
+  rDdStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+          import logging
+
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          logger.addHandler(logging.StreamHandler())
+
+          def prep_sqs_metadata(event_data, n):
+              # sample queue data #
+              # {
+              # "CaseID": "INC098080",
+              # "AccountID": "123456789012",
+              # "Region": "ap-south-east-2",
+              # "ArtifactRoot": "s3://234567890123-memory-artifacts/v15Jan2019-Disk-Memory-Demo/123456789012/i-069922242514cdf0e/memory/",
+              # "SourceFileName": "i-665922242514cdf0e.raw.gz",
+              # "SHAFileName": "i-665922242514cdf0e.raw.sha256",
+              # "MD5FileName": "i-665922242514cdf0e.raw.md5",
+              # "SourceType": "Memory"
+              # }
+              case_metadata = dict ()
+              case_metadata['CaseID'] = event_data['CaseId']
+              case_metadata['AccountID'] = event_data['Account']
+              case_metadata['Region'] = event_data['Region']
+              case_metadata['ArtifactRoot'] = event_data['CreateTargetUrls']['Output'][n]['ArtifactRoot']
+              case_metadata['SourceFileName'] = event_data['CreateTargetUrls']['Output'][n]['OriginalVol']+".raw.gz"
+              case_metadata['SHAFileName'] = event_data['CreateTargetUrls']['Output'][n]['OriginalVol']+".raw.sha256"
+              case_metadata['MD5FileName'] = event_data['CreateTargetUrls']['Output'][n]['OriginalVol']+".raw.md5"
+              case_metadata['SourceType'] = "Disk"
+              
+              return case_metadata
+
+          def lambda_handler(event, context):
+              try:
+                
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  
+                  for index, command in enumerate(event['StartCopy']):
+                      results = ssm.get_command_invocation(
+                          CommandId=command,
+                          InstanceId=event['RunInstancesForDd']['DdInstanceIds'][index]
+                      )
+                      logger.info('\n Results from SSM Command:\n')
+                      logger.info(results)
+                      if results['StatusDetails'] == 'Failed':
+                          raise GeneralException("Job failed with status: {}".format(results['StatusDetails']))
+                      elif not results['StatusDetails'] == 'Success':
+                          # raise Exception("Job Not finished or failed {}".format(results['StatusDetails']))            
+                          raise WaitException("Job Not finished {}".format(results['StatusDetails']))   
+                      elif results['StatusDetails'] == 'Success':
+                          return "Command completed successfully & SQS Notification Messages sent."
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  if exception_type == 'GeneralException':
+                      raise GeneralException(api_exception_obj)
+                  elif exception_type == 'WaitException':
+                      raise WaitException(api_exception_obj)
+                  else:
+                      raise        
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DdCopyStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Checks status of raw volume copies
+  
+  rDetachVolumes:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+          import time
+
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                
+                  detatch_results = []
+
+                  for index, output in enumerate(event['CreateTargetUrls']['Output']):
+                      print(f"Case {event['CaseId']} - Detatching volume {output['vol']} from Instance {event['RunInstancesForDd']['DdInstanceIds'][index]}")
+
+                      detatch = ec2.detach_volume(
+                          InstanceId=event['RunInstancesForDd']['DdInstanceIds'][index],
+                          VolumeId=output['vol']
+                      ) 
+                      
+                      detatch_results.append({detatch.get('VolumeId'): detatch.get('State')})
+                                              
+                  return detatch_results
+                      
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  raise GeneralException(api_exception_obj)
+                  
+
+          class GeneralException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DetachVolumes
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Checks status of raw volume copies
+
+  rDeleteArtifactsSource:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import time
+          import json
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  client = boto3.client('sts')
+                  
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ec2 = session.client('ec2', region_name=event['Region'])
+
+                  ec2_master = session.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+                  snapshots_source_region = []
+                  
+                  snapshots_master_region = []
+
+                  #Try to delete snapshots from source region
+                  try:
+                      for i, v in event['CreateSnapshots']['Output'].items():
+                          for vol, snap in v.items():
+                              snapshots_source_region.append(snap)
+                      if len(snapshots_source_region) > 0: 
+                          for snap in snapshots_source_region:
+                              snap_copy = ec2.delete_snapshot(SnapshotId=snap)
+                      
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+                  
+                  #Try to delete snapshots copied to master region
+                  try:
+                      for i, v in event['CopySnapshotsSharing']['Output'].items():
+                          for vol, snap in v.items():
+                              snapshots_master_region.append(snap)
+                      if len(snapshots_master_region) > 0: 
+                          for snap in snapshots_master_region:
+                              snap_copy = ec2_master.delete_snapshot(SnapshotId=snap)
+                      
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+
+                  # Create a JSON string
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  
+                  raise CustomException(json.dumps(api_exception_obj))
+                  
+
+          class CustomException(Exception):
+              pass
+          class WaitException(Exception):
+              pass
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DeleteArtifactsSource
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Cleanup Lambda for Step Function
+
+  rDeleteInstanceAndVolumesSecurityAccount:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2020 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+          #
+
+
+          import boto3
+          import os
+          import uuid
+          import time
+          import json
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              try:
+
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+                  instances = []
+                  
+                  try:
+                      for i in event['RunInstancesForDd']['DdInstanceIds']:
+                          instances.append(i)
+                  
+                  except (KeyError, AttributeError):
+                      pass
+                  
+                  if len(instances) > 0:
+                      try:
+                          for inst in instances:
+                              results = ec2.terminate_instances(InstanceIds=[inst])
+                      except (KeyError, ClientError):
+                          pass
+              
+                  volumes = []
+
+                  try:
+                      for i, v in event['CreateVolumesDD']['Output'].items():
+                          for snap, vol in v.items():
+                              volumes.append(vol)
+                      if len(volumes) > 0:
+                          for vol in volumes:
+                              vol_copy = ec2.delete_volume(VolumeId=vol)
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+                
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+
+                  # Create a JSON string
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  
+                  raise CustomException(json.dumps(api_exception_obj))
+                  
+
+          class CustomException(Exception):
+              pass
+          class WaitException(Exception):
+              pass
+
+      Role: !GetAtt rLambdaRole.Arn
+      FunctionName: DeleteInstanceAndVolumesSecurityAccount
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Instance and Volume Cleanup Lambda for Step Function
+
+  rDeleteSnapshotsSecurityAccount:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2020 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import time
+          import json
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              try:
+
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+                  snapshots = []
+
+                  #Try to delete snapshots in security account 
+                  try:
+                      for i, v in event['CopySnapshots']['Output'].items():
+                          for snap in v.get('SnapshotIds'):
+                              snapshots.append(snap)
+                      if len(snapshots) > 0: 
+                          for snap in snapshots:
+                              snap_copy = ec2.delete_snapshot(SnapshotId=snap)
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+                
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+
+                  # Create a JSON string
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  
+                  raise CustomException(json.dumps(api_exception_obj))
+                  
+
+          class CustomException(Exception):
+              pass
+          class WaitException(Exception):
+              pass
+
+      Role: !GetAtt rLambdaRole.Arn
+      FunctionName: DeleteSnapshotsSecurityAccount
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Snapshot Cleanup Lambda for Step Function
+
+  rDeleteCleanup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import time
+          import json
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              try:
+                  
+                  #cleanup source account artefacts
+                  client = boto3.client('sts')
+                  
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ec2 = session.client('ec2', region_name=event['Region'])
+
+                  ec2_master = session.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+                  snapshots_source_region = []
+                  
+                  snapshots_master_region = []
+
+                  #Try to delete snapshots from source region
+                  try:
+                      for i, v in event['CreateSnapshots']['Output'].items():
+                          for vol, snap in v.items():
+                              snapshots_source_region.append(snap)
+                      if snapshots_source_region: 
+                          for snap in snapshots_source_region:
+                              print(f"Attempting to delete Snapshot {snap} from {event['Account']} in Region {event['Region']}")
+                              snap_delete_result = ec2.delete_snapshot(SnapshotId=snap)
+                              print(f"Snapshot deletion result for Snapshot {snap}: {json.dumps(snap_delete_result)}")
+
+                      
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+                  
+                  #Try to delete snapshots copied to master region
+                  try:
+                      for i, v in event['CopySnapshotsSharing']['Output'].items():
+                          for vol, snap in v.items():
+                              snapshots_master_region.append(snap)
+                      if snapshots_master_region: 
+                          for snap in snapshots_master_region:
+                              print(f"Attempting to delete Snapshot {snap} from {event['Account']} in Region {os.environ.get('MasterRegion')}")
+                              snap_delete_result = ec2_master.delete_snapshot(SnapshotId=snap)
+                              print(f"Snapshot deletion result for Snapshot {snap}: {json.dumps(snap_delete_result)}")
+
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+
+                  #cleanup security account artefacts
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+                  instances = []
+                  
+                  try:
+                      for i in event['RunInstancesForDd']['DdInstanceIds']:
+                          instances.append(i)
+                  
+                  except (KeyError, AttributeError):
+                      pass
+                  
+                  if instances:
+                      try:
+                          for inst in instances:
+                              print(f"Attempting to terminate Instance {inst} from Security Account {os.environ.get('AccountId')} in Region {os.environ.get('MasterRegion')}")
+                              instance_termination_result = ec2.terminate_instances(InstanceIds=[inst])
+                              print(f"Instance termination result for {inst}: {json.dumps(instance_termination_result)}")
+                      except (KeyError, ClientError):
+                          pass
+              
+                  ir_volumes = []
+                  ir_snapshots = []
+
+                  #Try to delete snapshots in security account 
+                  try:
+                      for i, v in event['CopySnapshots']['Output'].items():
+                          for snap in v.get('SnapshotIds'):
+                              ir_snapshots.append(snap)
+                      if ir_snapshots: 
+                          for snap in ir_snapshots:
+                              print(f"Attempting to delete Snapshot {snap} from Security Account {os.environ.get('AccountId')} in Region {os.environ.get('MasterRegion')}")
+                              snap_delete_result = ec2.delete_snapshot(SnapshotId=snap)
+                              print(f"Snapshot deletion result for Snapshot {snap}: {json.dumps(snap_delete_result)}")
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+
+                  try:
+                      for i, v in event['CreateVolumesDD']['Output'].items():
+                          for snap, vol in v.items():
+                              ir_volumes.append(vol)
+                      if ir_volumes:
+                          for vol in ir_volumes:
+                              print(f"Attempting to delete Volume {vol} from Security Account {os.environ.get('AccountId')} in Region {os.environ.get('MasterRegion')}")
+                              vol_delete_result = ec2.delete_volume(VolumeId=vol)
+                              print(f"Volume deletion result for Volume {vol}: {json.dumps(vol_delete_result)}")
+
+                  except (KeyError, AttributeError, ClientError):
+                      pass
+                
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": str(exception_message)
+                  }
+                  # Create a JSON string
+                  raise CustomException(api_exception_obj)
+                  
+          class CustomException(Exception):
+              pass
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DeleteCleanup
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Failure Cleanup Lambda for Step Function
+
+  rStateRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SnapshotAutomationStateRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaExecute
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt rCreateSnapshotFromInstance.Arn
+                  - !GetAtt rCheckSnapshotStatus.Arn
+                  - !GetAtt rCopySnapshotSharing.Arn
+                  - !GetAtt rCheckSnapshotCopySharingStatus.Arn
+                  - !GetAtt rCopySnapshotsToSecurity.Arn
+                  - !GetAtt rCheckSnapshotCopyStatus.Arn
+                  - !GetAtt rCreateVolumesDD.Arn
+                  - !GetAtt rCheckVolumeDDStatus.Arn
+                  - !GetAtt rCreateTargetUrls.Arn
+                  - !GetAtt rGetLocationData.Arn
+                  - !GetAtt rRunInstancesForDd.Arn
+                  - !GetAtt rCheckInstanceStatusCmd.Arn
+                  - !GetAtt rCheckInstanceStatus.Arn
+                  - !GetAtt rStartCopy.Arn
+                  - !GetAtt rDdStatus.Arn
+                  - !GetAtt rDetachVolumes.Arn
+                  - !GetAtt rDeleteArtifactsSource.Arn
+                  - !GetAtt rDeleteInstanceAndVolumesSecurityAccount.Arn
+                  - !GetAtt rDeleteSnapshotsSecurityAccount.Arn                  
+                  - !GetAtt rDeleteCleanup.Arn
+                  - !GetAtt rDumpMemory.Arn
+                  - !GetAtt rMemCheckDumpStatus.Arn
+                  - !GetAtt rTagForIsolation.Arn
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+
+  rMemLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: MemoryAutomationLambdaRole
+      Path: / 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+    
+  rMemLambdaPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: MemoryAutomationLambdaPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "sts:AssumeRole"
+            Resource: 
+              - !Sub "arn:${AWS::Partition}:iam::*:role/IRAutomation"
+              - !GetAtt rMemS3CopyRole.Arn
+          - Effect: Allow
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub "arn:${AWS::Partition}:logs:*"  
+      Roles:
+        - !Ref rMemLambdaRole
+
+
+  rMemS3CopyRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: MemoryAcquisition
+      MaxSessionDuration: 43200
+      Path: /
+      Policies:
+        - PolicyName: FindingRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt rMemLambdaRole.Arn
+
+
+  rMemoryModuleBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-memory-modules'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  rMemoryModuleBucketPolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16
+            reason: "This is still ok considering it's constrained by the condition key on the organization principal."
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rMemoryModuleBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: DenyInsecureConnections
+          Effect: Deny
+          Principal: "*"
+          Action: s3:*
+          Resource: !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}/*"
+          Condition:
+            Bool:
+              aws:SecureTransport: 'false'
+        - Sid: MemoryAcquisitionAccess
+          Effect: Allow
+          Principal:
+            AWS: !GetAtt rMemS3CopyRole.Arn
+          Action:
+            - s3:Get*
+            - s3:List*
+          Resource:
+            - !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}/*"
+            - !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}"
+        - Sid: AWSOrgAccessToMemoryModules
+          Principal: "*"
+          Action:
+            - s3:Get*
+            - s3:List*
+          Resource:
+            - !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}/*"
+          Effect: "Allow"
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Sub "${pOrgId}"
+  
+  rDumpMemory:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref AWS::Partition
+          AccountId: !Ref AWS::AccountId
+          S3CopyRole: !GetAtt rMemS3CopyRole.Arn
+          S3Bucket: !Ref pIRArtifactBucket
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  if not isinstance(event['InstanceId'], list):
+                      event['InstanceId'] = [event['InstanceId']]
+                  
+                  #Init SSM client (IRAutomation: Member Account)         
+                  sts = boto3.client('sts')
+                  ir_automation_credentials = sts.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )['Credentials']
+                  session = boto3.Session(
+                      aws_access_key_id=ir_automation_credentials['AccessKeyId'],
+                      aws_secret_access_key=ir_automation_credentials['SecretAccessKey'],
+                      aws_session_token=ir_automation_credentials['SessionToken']
+                  )
+                  ssm = session.client('ssm', region_name=event['Region'])
+                  
+                  s3_sts = boto3.client('sts')
+                
+                  output = {}
+
+                  for instance in event['InstanceId']:
+                      
+                      s3_prefix = "{1}/{2}/{0}/memory/*".format(
+                          instance,
+                          event['CaseId'],
+                          event['Account'],                
+                      )
+
+                      session_policy=f'''{{
+                          "Version":"2012-10-17",
+                          "Statement":{{
+                              "Sid":"S3LeastPrivilege",
+                              "Effect":"Allow",
+                              "Action":["s3:PutObject", "s3:PutObjectAcl"],
+                              "Resource":["arn:aws:s3:::{os.environ.get('S3Bucket')}/{s3_prefix}"]
+                              }}
+                      }}'''  
+
+                      #Retrieve temporary credentials for S3 memory artefact upload from target instance        
+                      restricted_s3_credentials = s3_sts.assume_role(
+                          RoleArn=os.environ.get("S3CopyRole"),
+                          RoleSessionName="{}-s3copy".format(str(uuid.uuid4())[:5]),
+                          DurationSeconds=3600,
+                          Policy=session_policy
+                      )['Credentials']
+                      
+                      sizetag = '--metadata OriginalSize=$MEMSIZE'
+                      acl = '--acl bucket-owner-full-control'
+
+                      s3 = 'aws s3 cp - s3://{3}/{1}/{2}/{0}/memory/{0}.raw'.format(
+                          instance,
+                          event['CaseId'],
+                          event['Account'],
+                          os.environ.get("S3Bucket"),
+                      )
+
+                      commands1 = [
+                          '#!/bin/bash',
+                          'osname=`cat /etc/os-release |grep PRETTY|cut -d \\" -f 2| sed "s/ /_/g"`',
+                          'if [ -e /usr/bin/yum ]',
+                          'then',
+                          '  if [ `rpm -qa|grep awscli|wc -l` -eq 0 ]; then yum -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          'else',
+                          '  if [ `dpkg -l|grep awscli|wc -l` -eq 0 ]; then DEBIAN_FRONTEND=noninteractive apt-get -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          'fi',
+                          'if [ `rpm -qa|grep awscli|wc -l` -eq 0 ]; then yum -y install unzip && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install; fi',
+                          'aws s3 cp s3://{}-memory-modules/$osname/`uname -r`/lime-`uname -r`.ko /tmp/lime.ko'.format(os.environ.get("AccountId")),                
+                          'if [ `lsmod|grep lime|wc -l` -gt 0 ]; then rmmod lime; fi',
+                          'insmod /tmp/lime.ko "path=tcp:4444 format=raw localhostonly=1"'
+                      ]
+                      commands2 = [
+                          '#!/bin/bash',
+                          'sleep 10',
+                          "export MEMSIZE=`awk '/MemTotal/ {print $2/1024/1024}' /proc/meminfo`",
+                          'export AWS_ACCESS_KEY_ID={}'.format(restricted_s3_credentials['AccessKeyId']),
+                          'export AWS_SECRET_ACCESS_KEY={}'.format(restricted_s3_credentials['SecretAccessKey']),
+                          'export AWS_SESSION_TOKEN={}'.format(restricted_s3_credentials['SessionToken']),
+                          'export AWS_DEFAULT_REGION={}'.format(event['Region']),
+                          'aws configure set default.s3.max_concurrent_requests 20',
+                          "cat < /dev/tcp/127.0.0.1/4444 | tee >(gzip | {0}.gz {1} {2}) >(md5sum | {0}.md5 {1} {2}) | sha256sum | {0}.sha256 {1} {2}".format(
+                              s3,
+                              sizetag,
+                              acl
+                          ),
+                          'rmmod lime.ko'
+                      ]
+
+                      response1 = ssm.send_command(
+                          InstanceIds= [instance],
+                          DocumentName='AWS-RunShellScript',
+                          Parameters={
+                              'commands': commands1,
+                              'executionTimeout': ['43200'] 
+                          },
+                          Comment='Insert LiME'
+                      )
+                      
+                      time.sleep(30)
+                      
+                      response2 = ssm.send_command(
+                          InstanceIds= [instance],
+                          DocumentName='AWS-RunShellScript',
+                          Parameters={
+                              'commands': commands2,
+                              'executionTimeout': ['43200'] 
+                          },
+                          Comment='Dump to S3'
+                      )
+                      output[instance] = [response1['Command']['CommandId'], response2['Command']['CommandId']]
+
+                      s3_export = dict ()
+                      s3_export['ArtifactRoot'] = 's3://{3}/{1}/{2}/{0}/memory/'.format(
+                          instance,
+                          event['CaseId'],
+                          event['Account'],
+                          os.environ.get("S3Bucket"),
+                      )
+
+                      s3_export['S3URL'] = '{0}.raw'.format(
+                          instance
+                      )
+
+
+                  return {
+                      "Output": output,
+                      "S3": s3_export
+                  }
+
+              except Exception as e:
+                  raise
+        
+      Role: !GetAtt rMemLambdaRole.Arn 
+      FunctionName: DumpMemory
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Memory Dump Lambda for Memory Automation Step Function
+
+  rMemCheckDumpStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+
+          import boto3
+          import os
+          import uuid
+          import json
+
+
+          def prep_sqs_metadata(event_data):
+              case_metadata = dict ()
+              case_metadata['CaseID'] = event_data['CaseId']
+              case_metadata['AccountID'] = event_data['Account']
+              case_metadata['Region'] = event_data['Region']
+              case_metadata['ArtifactRoot'] = event_data['DumpMemory']['S3']['ArtifactRoot']
+              case_metadata['SourceFileName'] = event_data['DumpMemory']['S3']['S3URL']+".gz"
+              case_metadata['SHAFileName'] = event_data['DumpMemory']['S3']['S3URL']+".sha256"
+              case_metadata['MD5FileName'] = event_data['DumpMemory']['S3']['S3URL']+".md5"
+              case_metadata['SourceType'] = "Memory"
+              
+              return case_metadata
+
+          def lambda_handler(event, context):
+              try:
+                                  
+                  client = boto3.client('sts')
+                  
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+                  
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+                  
+                  ssm = session.client('ssm', region_name=event['Region'])
+                  
+                  for eid in event['DumpMemory']['Output'][event['InstanceId']]:
+                      results = ssm.get_command_invocation(
+                          CommandId=eid,
+                          InstanceId=event['InstanceId']
+                      )
+                      print (results)
+                      if results['StatusDetails'] == 'Failed':
+                          raise GeneralException("Command failed {}".format(results['StatusDetails']))
+                      elif not results['StatusDetails'] == 'Success':
+                          raise Exception("Job Not finished or failed {}".format(results['StatusDetails']))            
+                      elif results['StatusDetails'] == 'Success':
+                          #Additional actions:
+                          # ssm = boto3.client('ssm')
+                          # ssm_response = ssm.get_parameter(Name="PostProcessingQueue",WithDecryption=True)
+                          # sQueue_url = ssm_response['Parameter']['Value']
+                          #logging.info(UbuntuAMIID)
+                          # Inset value in SQS
+
+                          # sqs = boto3.client('sqs')
+                          # response = sqs.send_message(
+                          #     QueueUrl=sQueue_url,
+                          #     DelaySeconds=10,
+                          #     MessageBody=json.dumps(prep_sqs_metadata(event))
+                          # )
+
+                          return "Memory Acquisition commands completed successfully."
+                          
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  api_exception_obj = {
+                      "isError": True,
+                      "type": exception_type,
+                      "message": exception_message
+                  }
+                  if exception_type == 'GeneralException':
+                      raise GeneralException(api_exception_obj)
+                  else:
+                      raise WaitException(api_exception_obj)
+
+
+          class WaitException(Exception):
+              pass
+
+          class GeneralException(Exception):
+              pass
+
+      Role: !GetAtt rMemLambdaRole.Arn 
+      FunctionName: DumpMemoryStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Check Memory Dump Status for Memory Automation Step Function
+
+  rTagForAnalysis:
+    Type: AWS::Lambda::Function
+    Properties:
+        Environment:
+          Variables:
+            Partition: !Ref "AWS::Partition"
+            AccountId: !Ref "AWS::AccountId"
+        Code:
+          ZipFile: |
+            import json
+            import boto3
+            import os
+            import uuid
+            import time
+
+            def lambda_handler(event, context):
+                try:
+                    client = boto3.client('sts')
+                    response = client.assume_role(
+                        RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                            os.environ.get("Partition", 'aws'),
+                            event['Account']
+                        ),
+                        RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                    )
+
+                    session = boto3.Session(
+                        aws_access_key_id=response['Credentials']['AccessKeyId'],
+                        aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                        aws_session_token=response['Credentials']['SessionToken']
+                    )
+
+                    client = session.client('ec2', region_name=event['Region'])
+                    client.create_tags(
+                        DryRun=False,
+                        Resources=[
+                            event['InstanceId'],
+                        ],
+                        Tags=[
+                            {
+                                'Key': 'SecurityIncidentStatus',
+                                'Value': 'Analyze'
+                            },
+                        ]
+                    )
+
+                except Exception as e:
+                   print(e)
+                return {
+                    "Output": event
+
+                }
+        Role: !GetAtt rMemLambdaRole.Arn
+        FunctionName: TagForAnalysis
+        Timeout: 60
+        Handler: index.lambda_handler
+        Runtime: python3.8
+        MemorySize: 128
+        Description: Tag the EC2 instance to get it isolated.
+
+  rTagForIsolation:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('sts')
+
+                  response = client.assume_role(
+                      RoleArn='arn:{}:iam::{}:role/IRAutomation'.format(
+                          os.environ.get("Partition", 'aws'),
+                          event['Account']
+                      ),
+                      RoleSessionName="{}-snapshot".format(str(uuid.uuid4())[:5])
+                  )
+
+                  session = boto3.Session(
+                      aws_access_key_id=response['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                      aws_session_token=response['Credentials']['SessionToken']
+                  )
+
+                  client = session.client('ec2', region_name=event['Region'])
+                  client.create_tags(
+                      DryRun=False,
+                      Resources=[
+                          event['InstanceId'],
+                      ],
+                      Tags=[
+                          {
+                              'Key': 'SecurityIncidentStatus',
+                              'Value': 'Isolate'
+                          },
+                      ]
+                  )
+
+              except Exception as e:
+                 print(e)
+              return {
+                  "Output": event
+              
+              }
+      Role: !GetAtt rMemLambdaRole.Arn 
+      FunctionName: TagForIsolation
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Description: Tag the EC2 instance to get it isolated.
+
+  rForensicsStateMachineDisk:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt rStateRole.Arn
+      DefinitionString: !Sub |
+        {
+                    "Comment": "Snapshot AutomationState Machine",
+                    "States": {
+                        "Failed": {
+                            "Type": "Fail",
+                            "Cause": "$"
+                        },
+                        "CreateSnapshot": {
+
+                              "Resource": "${rCreateSnapshotFromInstance.Arn}",
+                                "ResultPath": "$.CreateSnapshots",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForSnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [
+                                {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateSnapshot.error"
+                                }
+                                ]
+                            },
+                            "WaitForSnapshots": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "CheckSnapshotStatusFromInstance"
+                            },
+                            "CheckSnapshotStatusFromInstance": {
+                                "Resource": "${rCheckSnapshotStatus.Arn}",
+                                "ResultPath": "$.SnapshotStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CopySnapshotsForSharing",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotStatus.error"
+                                } ]
+                            },
+                            "CopySnapshotsForSharing": {
+                                "Resource": "${rCopySnapshotSharing.Arn}",
+                                "ResultPath": "$.CopySnapshotsSharing",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForCopySnapshotsSharing",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CopySnapshotsSharing.error"
+                                } ]
+                            },
+                            "WaitForCopySnapshotsSharing": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "SnapshotCopySharingStatus"
+                            },
+                            "SnapshotCopySharingStatus": {
+                                "Resource": "${rCheckSnapshotCopySharingStatus.Arn}",
+                                "ResultPath": "$.SnapshotCopySharingStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CopySnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotCopySharingStatus.error"
+                                } ]
+                            },
+                            "CopySnapshots": {
+                                "Resource": "${rCopySnapshotsToSecurity.Arn}",
+                                "ResultPath": "$.CopySnapshots",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForCopySnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CopySnapshots.error"
+                                } ]
+                            },
+                            "WaitForCopySnapshots": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "SnapshotCopyStatus"
+                            },
+                            "SnapshotCopyStatus": {
+                                "Resource": "${rCheckSnapshotCopyStatus.Arn}",
+                                "ResultPath": "$.SnapshotStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CreateVolumesForDD",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotStatus.error"
+                                } ]
+                            },
+                            "CreateVolumesForDD": {
+                                "Resource": "${rCreateVolumesDD.Arn}",
+                                "ResultPath": "$.CreateVolumesDD",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForVolumesDD",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateVolumes.error"
+                                } ]
+                            },
+                            "WaitForVolumesDD": {
+                                "Type": "Wait",
+                                "Seconds": 5,
+                                "Next": "VolumeForDDStatus"
+                            },
+                            "VolumeForDDStatus": {
+                                "Resource": "${rCheckVolumeDDStatus.Arn}",
+                                "ResultPath": "$.CheckVolumeDDStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CreateTargetUrls",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckVolumeStatus.error"
+                                } ]
+                            },
+                            "CreateTargetUrls": {
+                                "Resource": "${rCreateTargetUrls.Arn}",
+                                "ResultPath": "$.CreateTargetUrls",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "GetLocationData",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateTargetUrls.error"
+                                } ]
+                            },
+                            "GetLocationData": {
+                                "Resource": "${rGetLocationData.Arn}",
+                                "ResultPath": "$.GetLocationData",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "RunInstancesForDd",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.GetLocationData.error"
+                                } ]
+                            },
+                            "RunInstancesForDd": {
+                                "Resource": "${rRunInstancesForDd.Arn}",
+                                "ResultPath": "$.RunInstancesForDd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForInstance",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.RunInstancesForDd.error"
+                                } ]
+                            },
+                            "WaitForInstance": {
+                                "Type": "Wait",
+                                "Seconds": 120,
+                                "Next": "CheckInstanceStatusCmd"
+                            },
+                            "CheckInstanceStatusCmd": {
+                                "Resource": "${rCheckInstanceStatusCmd.Arn}",
+                                "ResultPath": "$.CheckInstanceStatusCmd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CheckInstanceStatus",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckInstanceStatusCmd.error"
+                                } ]
+                            },
+                            "CheckInstanceStatus": {
+                                "Resource": "${rCheckInstanceStatus.Arn}",
+                                "ResultPath": "$.CheckInstanceStatusCmd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "StartCopy",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckInstanceStatus.error"
+                                } ]
+                            },
+                            "StartCopy": {
+                                "Resource": "${rStartCopy.Arn}",
+                                "ResultPath": "$.StartCopy",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DdStatus",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.StartCopy.error"
+                                } ]
+                            },
+                            "DdStatus": {
+                                "Resource": "${rDdStatus.Arn}",
+                                "ResultPath": "$.DdStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 172800,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DetachVolumes",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.DdStatus.error"
+                                } ]
+                            },
+                              "DetachVolumes": {
+                                "Resource": "${rDetachVolumes.Arn}",
+                                "ResultPath": "$.DetachVolumes",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForDetatchVolumes",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.StartCopy.error"
+                                } ]
+                            },
+                            "WaitForDetatchVolumes": {
+                                "Type": "Wait",
+                                "Seconds": 60,
+                                "Next": "DeleteSourceArtifacts"
+                            },
+                            "DeleteSourceArtifacts": {
+                                "Resource": "${rDeleteArtifactsSource.Arn}",
+                                "ResultPath": "$.DeleteSourceArtifacts",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "ChoiceStateDelete",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "ChoiceStateDelete": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                  "Variable": "$.RetainArtefacts",
+                                  "StringEquals": "true",
+                                  "Next": "DeleteInstanceAndVolumesSecurityAccount"
+                              },
+                              {
+                                "Variable": "$.RetainArtefacts",
+                                "StringEquals": "false",
+                                "Next": "DeleteSnapshotsSecurityAccount"
+                              }
+                            ],
+                            "Default": "DeleteSnapshotsSecurityAccount"
+                            },
+                            "DeleteInstanceAndVolumesSecurityAccount": {
+                                "Resource": "${rDeleteInstanceAndVolumesSecurityAccount.Arn}",
+                                "ResultPath": "$.DeleteInstanceAndVolumesSecurityAccount",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "EndDiskState",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "DeleteSnapshotsSecurityAccount": {
+                                "Resource": "${rDeleteSnapshotsSecurityAccount.Arn}",
+                                "ResultPath": "$.DeleteSnapshotsSecurityAccount",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DeleteInstanceAndVolumesSecurityAccount",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "FailureCleanup": {
+                                "Resource": "${rDeleteCleanup.Arn}",
+                                "ResultPath": "$.FailureCleanup",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "Failed",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed",
+                                    "ResultPath": "$"
+                                } ]
+                            },
+                            "EndDiskState": {
+                                "End": true,
+                                "Type": "Pass"
+                            }
+                        },
+          "StartAt": "CreateSnapshot"
+
+
+                }
+      StateMachineName: DiskAcquisition
+
+  rForensicsStateMachineMemory:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt rStateRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Snapshot AutomationState Machine",
+          "States": {
+              "Failed": {
+                  "Type": "Fail",
+                  "Cause": "$"
+              },
+              "DumpMemory": {
+                                        "Resource": "${rDumpMemory.Arn}",
+                                        "ResultPath": "$.DumpMemory",
+                                        "InputPath": "$",
+                                        "TimeoutSeconds": 86400,
+                                        "HeartbeatSeconds": 60,
+                                        "Next": "WaitForMemdump",
+                                        "Type": "Task",
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [ "States.Timeout" ],
+                                                "IntervalSeconds": 30,
+                                                "MaxAttempts": 10,
+                                                "BackoffRate": 2
+                                            }
+                                        ],
+                                        "Catch": [ {
+                                            "ErrorEquals": [ "States.ALL" ],
+                                            "Next": "Failed",
+                                            "ResultPath": "$.DumpMemory.error"
+                                        } ]
+                                    },
+                                    "WaitForMemdump": {
+                                        "Type": "Wait",
+                                        "Seconds": 5,
+                                        "Next": "CheckDumpStatus"
+                                    },
+                                    "CheckDumpStatus": {
+                                        "Resource": "${rMemCheckDumpStatus.Arn}",
+                                        "ResultPath": "$.CheckDumpStatus",
+                                        "InputPath": "$",
+                                        "TimeoutSeconds": 86400,
+                                        "HeartbeatSeconds": 60,
+                                        "Next": "EndMemState",
+                                        "Type": "Task",
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [ "WaitException" ],
+                                                "IntervalSeconds": 300,
+                                                "MaxAttempts": 31,
+                                                "BackoffRate": 1.09
+                                            },
+                                            {
+                                                "ErrorEquals": [ "States.Timeout" ],
+                                                "IntervalSeconds": 10,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1
+                                            }
+                                        ],
+                                        "Catch": [ {
+                                            "ErrorEquals": [ "States.ALL" ],
+                                            "Next": "Failed",
+                                            "ResultPath": "$.CheckDumpStatus.error"
+                                        } ]
+                                    },
+                                    "EndMemState": {
+                                        "End": true,
+                                        "Type": "Pass"
+                                    }
+          },
+          "StartAt": "DumpMemory"
+        }
+      StateMachineName: MemoryAcquisition
+
+
+
+
+
+  rForensicsStateMachineDiskAndMemory:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt rStateRole.Arn
+      DefinitionString: !Sub |
+          {    "StartAt": "RunForensics",
+                "Comment": "Snapshot AutomationState Machine",
+                "States": {
+                  "RunForensics": {
+                  "Type": "Parallel",
+                  "Branches": [
+                   {
+                     "StartAt": "CreateSnapshot",
+                     "States": {
+                     "Failed-Disk": {
+                      "Type": "Fail",
+                      "Cause": "$"
+                  },
+                     "CreateSnapshot": {
+                                "Resource": "${rCreateSnapshotFromInstance.Arn}",
+                                "ResultPath": "$.CreateSnapshots",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForSnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [
+                                {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateSnapshot.error"
+                                }
+                                ]
+                            },
+                            "WaitForSnapshots": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "CheckSnapshotStatusFromInstance"
+                            },
+                            "CheckSnapshotStatusFromInstance": {
+                                "Resource": "${rCheckSnapshotStatus.Arn}",
+                                "ResultPath": "$.SnapshotStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CopySnapshotsForSharing",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotStatus.error"
+                                } ]
+                            },
+                            "CopySnapshotsForSharing": {
+                                "Resource": "${rCopySnapshotSharing.Arn}",
+                                "ResultPath": "$.CopySnapshotsSharing",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForCopySnapshotsSharing",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CopySnapshotsSharing.error"
+                                } ]
+                            },
+                            "WaitForCopySnapshotsSharing": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "SnapshotCopySharingStatus"
+                            },
+                            "SnapshotCopySharingStatus": {
+                                "Resource": "${rCheckSnapshotCopySharingStatus.Arn}",
+                                "ResultPath": "$.SnapshotCopySharingStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CopySnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotCopySharingStatus.error"
+                                } ]
+                            },
+                            "CopySnapshots": {
+                                "Resource": "${rCopySnapshotsToSecurity.Arn}",
+                                "ResultPath": "$.CopySnapshots",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForCopySnapshots",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CopySnapshots.error"
+                                } ]
+                            },
+                            "WaitForCopySnapshots": {
+                                "Type": "Wait",
+                                "Seconds": 10,
+                                "Next": "SnapshotCopyStatus"
+                            },
+                            "SnapshotCopyStatus": {
+                                "Resource": "${rCheckSnapshotCopyStatus.Arn}",
+                                "ResultPath": "$.SnapshotStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CreateVolumesForDD",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.SnapshotStatus.error"
+                                } ]
+                            },
+                            "CreateVolumesForDD": {
+                                "Resource": "${rCreateVolumesDD.Arn}",
+                                "ResultPath": "$.CreateVolumesDD",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForVolumesDD",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateVolumes.error"
+                                } ]
+                            },
+                            "WaitForVolumesDD": {
+                                "Type": "Wait",
+                                "Seconds": 5,
+                                "Next": "VolumeForDDStatus"
+                            },
+                            "VolumeForDDStatus": {
+                                "Resource": "${rCheckVolumeDDStatus.Arn}",
+                                "ResultPath": "$.CheckVolumeDDStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CreateTargetUrls",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckVolumeStatus.error"
+                                } ]
+                            },
+                            "CreateTargetUrls": {
+                                "Resource": "${rCreateTargetUrls.Arn}",
+                                "ResultPath": "$.CreateTargetUrls",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "GetLocationData",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CreateTargetUrls.error"
+                                } ]
+                            },
+                            "GetLocationData": {
+                                "Resource": "${rGetLocationData.Arn}",
+                                "ResultPath": "$.GetLocationData",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "RunInstancesForDd",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 10,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.GetLocationData.error"
+                                } ]
+                            },
+                            "RunInstancesForDd": {
+                                "Resource": "${rRunInstancesForDd.Arn}",
+                                "ResultPath": "$.RunInstancesForDd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForInstance",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 30,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.RunInstancesForDd.error"
+                                } ]
+                            },
+                            "WaitForInstance": {
+                                "Type": "Wait",
+                                "Seconds": 120,
+                                "Next": "CheckInstanceStatusCmd"
+                            },
+                            "CheckInstanceStatusCmd": {
+                                "Resource": "${rCheckInstanceStatusCmd.Arn}",
+                                "ResultPath": "$.CheckInstanceStatusCmd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "CheckInstanceStatus",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckInstanceStatusCmd.error"
+                                } ]
+                            },
+                            "CheckInstanceStatus": {
+                                "Resource": "${rCheckInstanceStatus.Arn}",
+                                "ResultPath": "$.CheckInstanceStatusCmd",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "StartCopy",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.CheckInstanceStatus.error"
+                                } ]
+                            },
+                            "StartCopy": {
+                                "Resource": "${rStartCopy.Arn}",
+                                "ResultPath": "$.StartCopy",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DdStatus",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.StartCopy.error"
+                                } ]
+                            },
+                            "DdStatus": {
+                                "Resource": "${rDdStatus.Arn}",
+                                "ResultPath": "$.DdStatus",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 172800,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DetachVolumes",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    },
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.DdStatus.error"
+                                } ]
+                            },
+                              "DetachVolumes": {
+                                "Resource": "${rDetachVolumes.Arn}",
+                                "ResultPath": "$.DetachVolumes",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "WaitForDetatchVolumes",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 3,
+                                        "BackoffRate": 1
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "FailureCleanup",
+                                    "ResultPath": "$.StartCopy.error"
+                                } ]
+                            },
+                            "WaitForDetatchVolumes": {
+                                "Type": "Wait",
+                                "Seconds": 60,
+                                "Next": "DeleteSourceArtifacts"
+                            },
+                            "DeleteSourceArtifacts": {
+                                "Resource": "${rDeleteArtifactsSource.Arn}",
+                                "ResultPath": "$.DeleteSourceArtifacts",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "ChoiceStateDelete",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed-Disk",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "ChoiceStateDelete": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                  "Variable": "$.RetainArtefacts",
+                                  "StringEquals": "true",
+                                  "Next": "DeleteInstanceAndVolumesSecurityAccount"
+                              },
+                              {
+                                "Variable": "$.RetainArtefacts",
+                                "StringEquals": "false",
+                                "Next": "DeleteSnapshotsSecurityAccount"
+                              }
+                            ],
+                            "Default": "DeleteSnapshotsSecurityAccount"
+                            },
+                            "DeleteInstanceAndVolumesSecurityAccount": {
+                                "Resource": "${rDeleteInstanceAndVolumesSecurityAccount.Arn}",
+                                "ResultPath": "$.DeleteInstanceAndVolumesSecurityAccount",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "EndDiskState",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed-Disk",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "DeleteSnapshotsSecurityAccount": {
+                                "Resource": "${rDeleteSnapshotsSecurityAccount.Arn}",
+                                "ResultPath": "$.DeleteSnapshotsSecurityAccount",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "DeleteInstanceAndVolumesSecurityAccount",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    },
+                                    {
+                                        "ErrorEquals": [ "WaitException" ],
+                                        "IntervalSeconds": 300,
+                                        "MaxAttempts": 31,
+                                        "BackoffRate": 1.09
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed-Disk",
+                                    "ResultPath": "$.DeleteSnapshot.error"
+                                } ]
+                            },
+                            "FailureCleanup": {
+                                "Resource": "${rDeleteCleanup.Arn}",
+                                "ResultPath": "$.FailureCleanup",
+                                "InputPath": "$",
+                                "TimeoutSeconds": 86400,
+                                "HeartbeatSeconds": 60,
+                                "Next": "Failed-Disk",
+                                "Type": "Task",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [ "States.Timeout" ],
+                                        "IntervalSeconds": 10,
+                                        "MaxAttempts": 5,
+                                        "BackoffRate": 2
+                                    }
+                                ],
+                                "Catch": [ {
+                                    "ErrorEquals": [ "States.ALL" ],
+                                    "Next": "Failed-Disk",
+                                    "ResultPath": "$"
+                                } ]
+                            },
+                            "EndDiskState": {
+                                "End": true,
+                                "Type": "Pass"
+                            }
+                        }
+
+                },
+                    {"StartAt": "DumpMemory",
+                      "States":{
+                      "Failed-Mem": {
+                      "Type": "Fail",
+                      "Cause": "$"
+                  },
+                      "DumpMemory": {
+                                  "Resource": "${rDumpMemory.Arn}",
+                                  "ResultPath": "$.DumpMemory",
+                                  "InputPath": "$",
+                                  "TimeoutSeconds": 86400,
+                                  "HeartbeatSeconds": 60,
+                                  "Next": "WaitForMemdump",
+                                  "Type": "Task",
+                                  "Retry": [
+                                      {
+                                          "ErrorEquals": [ "States.Timeout" ],
+                                          "IntervalSeconds": 30,
+                                          "MaxAttempts": 10,
+                                          "BackoffRate": 2
+                                      }
+                                  ],
+                                  "Catch": [ {
+                                      "ErrorEquals": [ "States.ALL" ],
+                                      "Next": "Failed-Mem",
+                                      "ResultPath": "$.DumpMemory.error"
+                                  } ]
+                              },
+                              "WaitForMemdump": {
+                                  "Type": "Wait",
+                                  "Seconds": 5,
+                                  "Next": "CheckDumpStatus"
+                              },
+                              "CheckDumpStatus": {
+                                  "Resource": "${rMemCheckDumpStatus.Arn}",
+                                  "ResultPath": "$.CheckDumpStatus",
+                                  "InputPath": "$",
+                                  "TimeoutSeconds": 86400,
+                                  "HeartbeatSeconds": 60,
+                                  "Next": "EndMemState",
+                                  "Type": "Task",
+                                  "Retry": [
+                                      {
+                                          "ErrorEquals": [ "WaitException" ],
+                                          "IntervalSeconds": 300,
+                                          "MaxAttempts": 31,
+                                          "BackoffRate": 1.09
+                                      },
+                                      {
+                                          "ErrorEquals": [ "States.Timeout" ],
+                                          "IntervalSeconds": 10,
+                                          "MaxAttempts": 3,
+                                          "BackoffRate": 1
+                                      }
+                                  ],
+                                  "Catch": [ {
+                                      "ErrorEquals": [ "States.ALL" ],
+                                      "Next": "Failed-Mem",
+                                      "ResultPath": "$.CheckDumpStatus.error"
+                                  } ]
+                              },
+                              "EndMemState": {
+                                  "End": true,
+                                  "Type": "Pass"
+                              }
+
+                }}
+                    ],
+                      "ResultPath": "$.ParralelOutput",
+                          "Catch": [{
+                              "Comment": "This catch should never catch any errors, as the error handling is done in the individual Branches",
+                              "ErrorEquals": ["States.ALL"],
+                              "ResultPath": "$.ParralelOutput",
+                              "Next": "TagForIsolation"
+                          }],
+                          "Next": "TagForIsolation"
+                      },
+                    "TagForIsolation": {
+                          "Resource": "arn:aws:lambda:us-east-2:540709705818:function:TagForIsolation",
+                          "ResultPath": "$.TagForIsolation",
+                          "InputPath": "$",
+                          "TimeoutSeconds": 86400,
+                          "HeartbeatSeconds": 60,
+                          "End": true,
+                          "Type": "Task",
+                          "Retry": [
+                              {
+                                  "ErrorEquals": [ "States.Timeout" ],
+                                  "IntervalSeconds": 10,
+                                  "MaxAttempts": 5,
+                                  "BackoffRate": 2
+                              },
+                              {
+                                  "ErrorEquals": [ "WaitException" ],
+                                  "IntervalSeconds": 300,
+                                  "MaxAttempts": 31,
+                                  "BackoffRate": 1.09
+                              }
+                          ],
+                          "Catch": [ {
+                              "ErrorEquals": [ "States.ALL" ],
+                              "Next": "Failed-End",
+                              "ResultPath": "$.TagForIsolation.error"
+                          } ]
+                      },"Failed-End": {
+                        "Type": "Fail",
+                        "Cause": "$"
+                      }
+                  }}
+      StateMachineName: DiskAndMemAcquisition
+  
