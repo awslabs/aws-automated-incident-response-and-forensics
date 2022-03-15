@@ -16,6 +16,9 @@ The goal is to provide a set of processes enabled by Lambda functions as to:
 - Provide an automated repeatable processes, alligned with the AWS IR White Paper
 - Provide segregation of accounts to operate the automation steps, store artifacts and create forensic environments 
 
+## Limitations
+Note that this framework does not intend to generate artifacts which can be considered as electronic evidence, submissible in court.  
+
 ## Overview of the Framework
 
 Automated Incident Response and Forensics follows a standard digital forensic process (or phases) consisting of:
