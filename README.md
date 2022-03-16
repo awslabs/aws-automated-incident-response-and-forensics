@@ -73,8 +73,15 @@ This can be later used for spinning up EC2 instance for analysis of the gathered
 ## Installing the CloudFormation scripts 
 The CloudFormation scripts are marked 1 to 8, with the first word of the script name indicating in which account the script needs to be deployed. Note that the order of launching the CFN templates is important. 
 
-### 5-security-LiME_Volatility_Factory
-This script spins up machines to build the memory modules based on given AMI IDs. To gather or update new memory modules, you need to delete the CFN stack and re-create it with the new AMI IDs (if you try updating the CFN with new AMI ids it will not work). Note that the S3 bucket with the existing memory modules will remain as it is created seperately. 
+- 1-forensic-AnalysisVPCnS3Buckets.yaml: deployed in the forensics account and creates the S3 buckets, VPCs and enables CloudTrail
+- 2-forensic-MaintenanceVPCnEC2ImageBuilderPipeline.yaml:  Deploys the maintenance VPC and image builder pipeline based on SANS SIFT
+- 3-security_LiME_Volatility_Factory_s3_bucket.yaml: Creates the S3 bucket where the memory modules for LiME will be stored
+- 4-security_IR-Disk_Mem_automation.yaml: Deploys the functions in the security account which enable disk and memory acquisition. 
+- 5-security_LiME_Volatility_Factory.yaml: Triggers a build function to start creating the memory modules based of the given AMI ids. Note that AMI ids are different across regions. Whenever you need new memory modules, you can simply re-run this script with the new AMI ids. You could consider integrating this with your golden image AMI builder pipelines (if used in your environment)
+- 6-member-IR-automation.yam: Creates the member IR automation function which triggers the IR process. It allows for sharing EBS volumes across accounts, automated posting to Slack channels during the IR process, triggering the forensics process  and isolating the instances after the process finishes.
+- 7-forensic-artifact-s3-policies.yaml: After all the scripts have been deployed this script fixes the permissions required for all the cross-account interactions. 
+- 8-security-IR-vpc.yaml: Configures a VPC used for IR volume processing
+
 
 ## Operating the Incident Response Framework
 The incident response framework can be triggered by creating a Tag with key `SecurityIncidentStatus` with value `Analyze`. This will trigger the member Lambda function that will automatically start isolation and memory/disk acquisition. It will also re-tag the asset at the end (or on failure) with `Contain`. This triggers the containment which fully isolates the instance with a no INBOUND/OUTBOUND security group and with an IAM role that disallows all access.
