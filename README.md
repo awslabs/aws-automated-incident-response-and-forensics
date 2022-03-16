@@ -170,7 +170,6 @@ Once you have done that you can trigger responses on EC2 events by using the act
 ## Future Roadmap
 - Support for Windows
 - Support for ARM based AMIs 
-- Automated launch of a cuckoo sandbox
-
+- Better way of generating memory modules automatically without having to recreate the CloudFormation stack
 
 
