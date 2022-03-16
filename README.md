@@ -84,7 +84,7 @@ The CloudFormation scripts are marked 1 to 8, with the first word of the script 
 
 
 ## Operating the Incident Response Framework
-The incident response framework can be triggered by creating a Tag with key `SecurityIncidentStatus` with value `Analyze`. This will trigger the member Lambda function that will automatically start isolation and memory/disk acquisition. It will also re-tag the asset at the end (or on failure) with `Contain`. This triggers the containment which fully isolates the instance with a no INBOUND/OUTBOUND security group and with an IAM role that disallows all access.
+The incident response framework can be triggered by creating a Tag with key `SecurityIncidentStatus` and value `Analyze` for a given EC2 instance. This will trigger the member Lambda function that will automatically start isolation and memory/disk acquisition. It will also re-tag the asset at the end (or on failure) with `Contain`. This triggers the containment which fully isolates the instance with a no INBOUND/OUTBOUND security group and with an IAM role that disallows all access.
 
 When an EC2 instance is compromised or suspect to be compromised, a tag must be attached to it  with as key SecurityIncidentStatus with as value either "Analyze" or "Contain" (note that this is case sensitive).
 
