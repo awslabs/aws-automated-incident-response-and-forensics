@@ -65,8 +65,7 @@ This can be later used for spinning up EC2 instance for analysis of the gathered
 3.	In Member accounts:
  	* EC2 role needs to have access to S3 (Get / List) and be accessible by SSM. It’s suggested to use AWS managed roles:
 		* AmazonSSMManagedInstanceCore
-		* AmazonS3ReadOnlyAccess
-		* Note that these roles will automatically be attached to the instance when IR is triggered, until the response has finished after which the IAM will remove all rights to the instance
+		* Note that this role will automatically be attached to the instance when IR is triggered, until the response has finished after which the IAM will remove all rights to the instance
 	* VPC Endpoints need to be added to VPC and Subnets in which the target EC2 instances reside. Those endpoints are: S3 (gateway), EC2messages, SSM and SSMMessages
 4.	If the EC2 instances don’t have AWS CLI installed, Internet access will be required for the disk snapshot and memory acquisition to work. In this case the scripts will reach out to the Internet to download the AWS CLI installation files and will install them on the instance in scope.
 
