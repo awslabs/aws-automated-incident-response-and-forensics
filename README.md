@@ -78,7 +78,7 @@ The CloudFormation scripts are marked 1 to 8, with the first word of the script 
 - 3-security_LiME_Volatility_Factory_s3_bucket.yaml: Creates the S3 bucket where the memory modules for LiME will be stored
 - 4-security_IR-Disk_Mem_automation.yaml: Deploys the functions in the security account which enable disk and memory acquisition. 
 - 5-security_LiME_Volatility_Factory.yaml: Triggers a build function to start creating the memory modules based of the given AMI ids. Note that AMI ids are different across regions. Whenever you need new memory modules, you can simply re-run this script with the new AMI ids. You could consider integrating this with your golden image AMI builder pipelines (if used in your environment)
-- 6-member-IR-automation.yam: Creates the member IR automation function which triggers the IR process. It allows for sharing EBS volumes across accounts, automated posting to Slack channels during the IR process, triggering the forensics process  and isolating the instances after the process finishes.
+- 6-member-IR-automation.yaml: Creates the member IR automation function which triggers the IR process. It allows for sharing EBS volumes across accounts, automated posting to Slack channels during the IR process, triggering the forensics process  and isolating the instances after the process finishes.
 - 7-forensic-artifact-s3-policies.yaml: After all the scripts have been deployed this script fixes the permissions required for all the cross-account interactions. 
 - 8-security-IR-vpc.yaml: Configures a VPC used for IR volume processing
 
