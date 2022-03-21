@@ -3,12 +3,12 @@
 
 ## Use Case
 
-This use-case was developed for a customer in the automotive industry operating a large set of accounts. Their problems were:
+This use case was developed for a customer in the automotive industry operating a large set of accounts. Their problems were:
 - Incident Response and Forensics was a manual process prone to mistakes
 - Time-consuming process with many steps 
 - Hard to perform by non-trained personnel 
 
-To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://d1.awsstatic.com/whitepapers/aws_security_incident_response.pdf). 
+To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://docs.aws.amazon.com/whitepapers/latest/overview-aws-cloud-adoption-framework/overview-aws-cloud-adoption-framework.pdf). 
 
 ## Goals
 The goal is to provide a set of processes enabled by Lambda functions as to: 
@@ -47,7 +47,7 @@ The environment will consist of 2 main accounts – a Security and a Forensics a
 The Security account is where the 2 main Step Functions are created for memory and disk image acquisition. Once running, those reach into the Member account (an account with the EC2 instances involved in an incident) and trigger a set of Lambda functions that will gather either a memory or disk dump. Those artifacts are then stored in the Forensics account.
 
 A Forensics account will hold the artifacts gathered by the Step Functions in the “Analysis artifacts” S3 bucket.
-The Forensics account will also have a EC2 Image Builder pipeline that builds an AMI image of a Forensics instance. Currently it’s based on SANS SIFT Workstation (https://www.sans.org/tools/sift-workstation/). The build process uses the Maintenance VPC which has connectivity to the Internet. 
+The Forensics account will also have a EC2 Image Builder pipeline that builds an AMI image of a Forensics instance. Currently it’s based on [SANS SIFT Workstation](https://www.sans.org/tools/sift-workstation/). The build process uses the Maintenance VPC which has connectivity to the Internet. 
 This can be later used for spinning up EC2 instance for analysis of the gathered artifacts in the Analysis VPC. The Analysis VPC does not have Internet connectivity. By default, the AWS ProServe creates 3 analysis subnets. More subnets can be created (up to 200 which is the quota for number of subnets in VPC) but the VPC endpoints need to have those subnets added for SSM Sessions Manager to work in them.
 
 
