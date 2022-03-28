@@ -8,7 +8,7 @@ This use-case was developed for a customer in the automotive industry operating 
 - Time-consuming process with many steps 
 - Hard to perform by non-trained personnel 
 
-To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://d1.awsstatic.com/whitepapers/aws_security_incident_response.pdf). 
+To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://docs.aws.amazon.com/whitepapers/latest/aws-security-incident-response-guide/welcome.html). 
 
 ## Goals
 The goal is to provide a set of processes enabled by Lambda functions as to: 
