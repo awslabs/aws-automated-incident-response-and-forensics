@@ -8,13 +8,16 @@ This use-case was developed for a customer in the automotive industry operating 
 - Time-consuming process with many steps 
 - Hard to perform by non-trained personnel 
 
-To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://d1.awsstatic.com/whitepapers/aws_security_incident_response.pdf). 
+To address this we created the Automated Incident Response and Forensics framework. The framework aims to facilitate automated steps for incident response and forensics based on the [AWS Incident Response White Paper](https://docs.aws.amazon.com/whitepapers/latest/aws-security-incident-response-guide/welcome.html). 
 
 ## Goals
 The goal is to provide a set of processes enabled by Lambda functions as to: 
 - Provide an easy way to trigger the IR process with minimum knowledge
 - Provide an automated repeatable processes, alligned with the AWS IR White Paper
 - Provide segregation of accounts to operate the automation steps, store artifacts and create forensic environments 
+
+## Limitations
+Note that this framework does not intend to generate artifacts which can be considered as electronic evidence, submissible in court.  
 
 ## Overview of the Framework
 
@@ -62,19 +65,25 @@ This can be later used for spinning up EC2 instance for analysis of the gathered
 3.	In Member accounts:
  	* EC2 role needs to have access to S3 (Get / List) and be accessible by SSM. It’s suggested to use AWS managed roles:
 		* AmazonSSMManagedInstanceCore
-		* AmazonS3ReadOnlyAccess
-		* Note that these roles will automatically be attached to the instance when IR is triggered, until the response has finished after which the IAM will remove all rights to the instance
+		* Note that this role will automatically be attached to the instance when IR is triggered, until the response has finished after which the IAM will remove all rights to the instance
 	* VPC Endpoints need to be added to VPC and Subnets in which the target EC2 instances reside. Those endpoints are: S3 (gateway), EC2messages, SSM and SSMMessages
 4.	If the EC2 instances don’t have AWS CLI installed, Internet access will be required for the disk snapshot and memory acquisition to work. In this case the scripts will reach out to the Internet to download the AWS CLI installation files and will install them on the instance in scope.
 
 ## Installing the CloudFormation scripts 
 The CloudFormation scripts are marked 1 to 8, with the first word of the script name indicating in which account the script needs to be deployed. Note that the order of launching the CFN templates is important. 
 
-### 5-security-LiME_Volatility_Factory
-This script spins up machines to build the memory modules based on given AMI IDs. To gather or update new memory modules, you need to delete the CFN stack and re-create it with the new AMI IDs (if you try updating the CFN with new AMI ids it will not work). Note that the S3 bucket with the existing memory modules will remain as it is created seperately. 
+- 1-forensic-AnalysisVPCnS3Buckets.yaml: deployed in the forensics account and creates the S3 buckets, VPCs and enables CloudTrail
+- 2-forensic-MaintenanceVPCnEC2ImageBuilderPipeline.yaml:  Deploys the maintenance VPC and image builder pipeline based on SANS SIFT
+- 3-security_LiME_Volatility_Factory_s3_bucket.yaml: Creates the S3 bucket where the memory modules for LiME will be stored
+- 4-security_IR-Disk_Mem_automation.yaml: Deploys the functions in the security account which enable disk and memory acquisition. 
+- 5-security_LiME_Volatility_Factory.yaml: Triggers a build function to start creating the memory modules based of the given AMI ids. Note that AMI ids are different across regions. Whenever you need new memory modules, you can simply re-run this script with the new AMI ids. You could consider integrating this with your golden image AMI builder pipelines (if used in your environment)
+- 6-member-IR-automation.yaml: Creates the member IR automation function which triggers the IR process. It allows for sharing EBS volumes across accounts, automated posting to Slack channels during the IR process, triggering the forensics process  and isolating the instances after the process finishes.
+- 7-forensic-artifact-s3-policies.yaml: After all the scripts have been deployed this script fixes the permissions required for all the cross-account interactions. 
+- 8-security-IR-vpc.yaml: Configures a VPC used for IR volume processing
+
 
 ## Operating the Incident Response Framework
-The incident response framework can be triggered by creating a Tag with key `SecurityIncidentStatus` with value `Analyze`. This will trigger the member Lambda function that will automatically start isolation and memory/disk acquisition. It will also re-tag the asset at the end (or on failure) with `Contain`. This triggers the containment which fully isolates the instance with a no INBOUND/OUTBOUND security group and with an IAM role that disallows all access.
+The incident response framework can be triggered by creating a Tag with key `SecurityIncidentStatus` and value `Analyze` for a given EC2 instance. This will trigger the member Lambda function that will automatically start isolation and memory/disk acquisition. It will also re-tag the asset at the end (or on failure) with `Contain`. This triggers the containment which fully isolates the instance with a no INBOUND/OUTBOUND security group and with an IAM role that disallows all access.
 
 When an EC2 instance is compromised or suspect to be compromised, a tag must be attached to it  with as key SecurityIncidentStatus with as value either "Analyze" or "Contain" (note that this is case sensitive).
 
@@ -160,7 +169,6 @@ Once you have done that you can trigger responses on EC2 events by using the act
 ## Future Roadmap
 - Support for Windows
 - Support for ARM based AMIs 
-- Automated launch of a cuckoo sandbox
-
+- Better way of generating memory modules automatically without having to recreate the CloudFormation stack
 
 
