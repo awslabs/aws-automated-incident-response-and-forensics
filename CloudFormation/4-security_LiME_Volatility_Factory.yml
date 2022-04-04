@@ -30,8 +30,7 @@ Parameters:
   pAmiIds:
     Type: "List<AWS::EC2::Image::Id>"
     Description: Amazon Linux AMI for DD Copy. Note that this can be a list of AMIs (e.g. ami-035be7bafff33b6b6,ami-995be7bafff33b6b8,ami-0be7bafff33b6b635 )
-    Default: "ami-00dfe2c7ce89a450b" #amazon linux v2
-    #was: "ami-035be7bafff33b6b6" but seems is no longer available
+    
 
   pSecurtiyAccount:
     Type: String
@@ -52,7 +51,7 @@ Parameters:
 
   pArtifactBucket:
     Type: String
-    Description: ARN of the S3 Bucket for the memory 
+    Description: ARN (not just bucket name) of the S3 Bucket for memory-modules bucket in the security account 
 
 Resources:
 

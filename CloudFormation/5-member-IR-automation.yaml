@@ -51,7 +51,7 @@ Parameters:
 
   SlackChannel:
     Type: String
-    Default: "#taking-over-the-world"
+    Default: "#security-incident-channel"
     Description: The incident channel used within Slack to respond to issues
 
   SecurityIncidentSNSTopicName:

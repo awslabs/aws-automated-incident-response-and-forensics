@@ -313,9 +313,9 @@ Resources:
                       sudo tar -C /usr/local -xzf go1.17.2.linux-amd64.tar.gz
                       export PATH=$PATH:/usr/local/go/bin
                       go install github.com/sigstore/cosign/cmd/cosign@latest
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli-linux
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli-linux.sig
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.11.0/sift-cli.pub
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli-linux
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli-linux.sig
+                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli.pub
                       /home/ubuntu/go/bin/cosign verify-blob -key sift-cli.pub -signature sift-cli-linux.sig sift-cli-linux
                       sudo mv sift-cli-linux /usr/local/bin/sift
                       chmod 755 /usr/local/bin/sift
@@ -358,6 +358,7 @@ Resources:
       InfrastructureConfigurationArn:
         Ref: SIFTImageInfrastructureConfiguration
 
+
   # Create an SSM Parameter Store entry with our resulting ImageId.
   # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ssm-parameter.html
   SIFTImageParameter:
@@ -368,6 +369,7 @@ Resources:
       Type: String
       Value:
         Fn::GetAtt: [SIFTImage, ImageId]
+    DependsOn: SIFTImage 
   
   SIFTDistributionConfiguration:
     Type: 'AWS::ImageBuilder::DistributionConfiguration'
