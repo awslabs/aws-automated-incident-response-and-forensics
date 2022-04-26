@@ -232,6 +232,13 @@ Resources:
               dkms build -m lime -v 1.8 -k ${i}-aws
               dkms build -m volatility -v 2.6.1 -k ${i}-aws
             done
+            for i in `apt-cache search linux-headers-.*-aws|cut -f 1 -d " "|cut -f 3,4 -d -`
+            do
+              DEBIAN_FRONTEND=noninteractive apt-get -y install linux-tools-${i}-aws linux-image-${i}-aws linux-headers-${i}-aws
+              sleep 5
+              dkms build -m lime -v 1.8 -k ${i}-aws
+              dkms build -m volatility -v 2.6.1 -k ${i}-aws
+            done
           fi
           
           echo -e \"SHELL=/bin/bash\nPATH=/sbin:/bin:/usr/bin:/usr/sbin\n*/2 * * * * root flock -nx /tmp/lock -c /usr/local/bin/update_script.sh\" > /etc/cron.d/update_modules
@@ -622,8 +629,8 @@ Resources:
               images = ec2.describe_images(ImageIds=[ami])
               for block in images['Images'][0]['BlockDeviceMappings']:
                   try:
-                      if block['Ebs']['VolumeSize'] < 40:
-                          block['Ebs']['VolumeSize'] = 40
+                      if block['Ebs']['VolumeSize'] < 80:
+                          block['Ebs']['VolumeSize'] = 80
                       
                       for i in ['SnapshotId', 'Encrypted', 'KmsKeyId']:
                           if i in block['Ebs'].keys():
