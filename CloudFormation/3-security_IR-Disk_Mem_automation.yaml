@@ -2487,6 +2487,7 @@ Resources:
             - s3:List*
           Resource:
             - !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}/*"
+            - !Sub "arn:${AWS::Partition}:s3:::${rMemoryModuleBucket}"
           Effect: "Allow"
           Condition:
             StringEquals:
