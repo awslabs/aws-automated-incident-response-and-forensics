@@ -28,7 +28,6 @@ Parameters:
     MaxLength: 12
     MinLength: 12
     ConstraintDescription: account number must contain only numbers.
-  
 
   SGNAME:
     Type: String
@@ -62,6 +61,10 @@ Parameters:
   SecurityAccountIncidentSNSTopicArn:
     Type: String
     Description: The ARN of the SNS topic within the Security Account
+
+  pArtifactBucket:
+    Type: String
+    Description: ARN (not just bucket name) of the S3 Bucket for memory-modules bucket in the security account
 
 Resources:
 
@@ -361,6 +364,19 @@ Resources:
         Path: "/"
         ManagedPolicyArns:
            - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        Policies:
+          - PolicyName: S3SecurityAccountModules
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "s3:GetObject"
+                  Resource: !Sub "${pArtifactBucket}/*"
+                - Effect: Allow
+                  Action:
+                    - "ec2:StopInstances"
+                  Resource: "*"
   
   IRIsolationInstanceProfile:
       Type: "AWS::IAM::InstanceProfile"

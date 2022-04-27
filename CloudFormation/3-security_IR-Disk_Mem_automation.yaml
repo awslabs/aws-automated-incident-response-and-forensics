@@ -4184,7 +4184,7 @@ Resources:
                           "Next": "TagForIsolation"
                       },
                     "TagForIsolation": {
-                          "Resource": "arn:aws:lambda:us-east-2:540709705818:function:TagForIsolation",
+                          "Resource": "${rTagForIsolation.Arn}",
                           "ResultPath": "$.TagForIsolation",
                           "InputPath": "$",
                           "TimeoutSeconds": 86400,
