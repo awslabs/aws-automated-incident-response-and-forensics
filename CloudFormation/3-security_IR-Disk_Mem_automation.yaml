@@ -2874,7 +2874,7 @@ Resources:
                       Tags=[
                           {
                               'Key': 'SecurityIncidentStatus',
-                              'Value': 'Isolate'
+                              'Value': 'Contain'
                           },
                       ]
                   )
