@@ -293,6 +293,14 @@ Resources:
               Protocol: lambda
         TopicName: !Ref SecurityIncidentSNSTopicName
 
+  SlackLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SecurityIncidentEventTopic
+      FunctionName: !Ref SlackNotificationLambdaFunction
+
 
   KMSKey:
       Type: "AWS::KMS::Key"
