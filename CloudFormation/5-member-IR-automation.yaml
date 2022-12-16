@@ -693,7 +693,7 @@ Resources:
                                     f"Incident Tag for Resource {instance_id}, changed to: {tags[key]} - Automation will not be triggered since Key Value does not match the configured incident value (Case-Sensitive)")
 
           - TopicARN: !Ref SecurityIncidentEventTopic
-        Runtime: "python3.7"
+        Runtime: "python3.9"
         Timeout: 180
   # Lambda Function for Notification
   SlackNotificationLambdaFunction:
@@ -733,7 +733,7 @@ Resources:
                   })
            - SlackURL: !Ref SlackURL
              SlackChannel: !Ref SlackChannel
-        Runtime: "python3.7"
+        Runtime: "python3.9"
         Timeout: 180
 
   # Create CloudWatch Event Rule to trigger Lambda for Remediation.

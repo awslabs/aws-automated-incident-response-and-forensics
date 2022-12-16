@@ -1,0 +1,7 @@
+# Frequently Asked Questions
+
+- [WaitException is triggered](#WaitException is triggered)
+
+
+## WaitException is triggered
+If the wait exception is triggered there may be a permission issue. Make sure to double check you have defined the variables for the CFN code correctly.

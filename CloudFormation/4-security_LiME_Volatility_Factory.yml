@@ -275,7 +275,7 @@ Resources:
       FunctionName: CreateBootstrap1
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
       Description: Create raw volume copies and upload to S3
       
@@ -401,7 +401,7 @@ Resources:
       FunctionName: CreateBootstrap2
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
       Description: Create raw volume copies and upload to S3
       
@@ -502,7 +502,7 @@ Resources:
       FunctionName: CreateBootstrap3
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
       Description: Create raw volume copies and upload to S3
       
@@ -553,7 +553,7 @@ Resources:
       FunctionName: TransformList
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
       Description: Transform list of amiIds to json
       
@@ -703,7 +703,7 @@ Resources:
       FunctionName: CreateInstances
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
         
   rCustomResource:
@@ -793,7 +793,7 @@ Resources:
       FunctionName: DeleteInstances
       Timeout: 300
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'
         
   rCustomTeardown:
@@ -876,5 +876,5 @@ Resources:
       FunctionName: ManageInstances
       Timeout: 900
       Handler: index.lambda_handler
-      Runtime: python3.6
+      Runtime: python3.9
       MemorySize: '128'

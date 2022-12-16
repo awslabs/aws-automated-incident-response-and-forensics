@@ -99,7 +99,7 @@ Resources:
       FunctionName: LambdaTriggerIRStepFunction
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Trigger the statemachine to perform IR
 
@@ -584,7 +584,7 @@ Resources:
       FunctionName: CreateSnapshotsFromInstance
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Creation Lambda for Disk Acquisition Step Function
 
@@ -678,7 +678,7 @@ Resources:
       FunctionName: CheckSnapshotStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Creation Status Lambda for Step Function
 
@@ -795,7 +795,7 @@ Resources:
       FunctionName: CopyAndShareSnapshots
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Creation Lambda for Disk Acquisition Step Function
 
@@ -874,7 +874,7 @@ Resources:
       FunctionName: CheckSnapshotCopySharingStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Copy Status Lambda for Step Function
 
@@ -961,7 +961,7 @@ Resources:
       FunctionName: CopySnapshots
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Creation Lambda for Disk Acquisition Step Function
 
@@ -1040,7 +1040,7 @@ Resources:
       FunctionName: CheckSnapshotCopyStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Copy Status Lambda for Step Function
 
@@ -1139,7 +1139,7 @@ Resources:
       FunctionName: VolumeCreationForDd
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Volume Creation for Snapshot Automation Step Function
 
@@ -1217,7 +1217,7 @@ Resources:
       FunctionName: CheckVolumeDDStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Check Volume Creation Status for Snapshot Automation Step Function
 
@@ -1308,7 +1308,7 @@ Resources:
       FunctionName: CreateTargetUrls
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Create raw volume copies and upload to S3
   
@@ -1407,7 +1407,7 @@ Resources:
       FunctionName: GetLocationData
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Get EC2 Placement data Lambda for Step Function
   
@@ -1516,7 +1516,7 @@ Resources:
       FunctionName: RunInstances
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Create raw volume copies and upload to S3
 
@@ -1582,7 +1582,7 @@ Resources:
       FunctionName: CheckInstanceStatusCmd
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Check To see if instances are ready for processing
 
@@ -1648,7 +1648,7 @@ Resources:
       FunctionName: InstanceCommandCheck
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Check Instance Status for Processing Automation Step Function
 
@@ -1748,7 +1748,7 @@ Resources:
       FunctionName: StartRawCopy
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Create raw volume copies and upload to S3
 
@@ -1848,7 +1848,7 @@ Resources:
       FunctionName: DdCopyStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Checks status of raw volume copies
   
@@ -1913,7 +1913,7 @@ Resources:
       FunctionName: DetachVolumes
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Checks status of raw volume copies
 
@@ -2016,7 +2016,7 @@ Resources:
       FunctionName: DeleteArtifactsSource
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Cleanup Lambda for Step Function
 
@@ -2102,7 +2102,7 @@ Resources:
       FunctionName: DeleteInstanceAndVolumesSecurityAccount
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Instance and Volume Cleanup Lambda for Step Function
 
@@ -2172,7 +2172,7 @@ Resources:
       FunctionName: DeleteSnapshotsSecurityAccount
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Snapshot Cleanup Lambda for Step Function
 
@@ -2327,7 +2327,7 @@ Resources:
       FunctionName: DeleteCleanup
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Failure Cleanup Lambda for Step Function
 
@@ -2656,7 +2656,7 @@ Resources:
       FunctionName: DumpMemory
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Memory Dump Lambda for Memory Automation Step Function
 
@@ -2768,7 +2768,7 @@ Resources:
       FunctionName: DumpMemoryStatus
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Check Memory Dump Status for Memory Automation Step Function
 
@@ -2828,7 +2828,7 @@ Resources:
         FunctionName: TagForAnalysis
         Timeout: 60
         Handler: index.lambda_handler
-        Runtime: python3.8
+        Runtime: python3.9
         MemorySize: 128
         Description: Tag the EC2 instance to get it isolated.
 
@@ -2889,7 +2889,7 @@ Resources:
       FunctionName: TagForIsolation
       Timeout: 60
       Handler: index.lambda_handler
-      Runtime: python3.8
+      Runtime: python3.9
       MemorySize: 128
       Description: Tag the EC2 instance to get it isolated.
 
