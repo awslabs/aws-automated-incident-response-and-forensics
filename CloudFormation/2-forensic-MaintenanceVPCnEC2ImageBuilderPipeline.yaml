@@ -21,7 +21,7 @@ Description: Creates parts of Forensics Env
 Parameters:  
   S3VPCFlowLogs:
     Type: String
-    Description: Name of the Forensic Account S3 Bucket for VPC Flow Logs. Usually it's <this account ID>-vpc-flowlogs
+    Description: Name of the Bunker Account S3 Bucket for VPC Flow Logs. Usually it's <this account ID>-vpc-flowlogs
     Default: '-vpc-flowlogs'
     AllowedPattern: "[a-zA-Z0-9-.]*"
     ConstraintDescription: bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-).
@@ -301,25 +301,10 @@ Resources:
                 inputs:
                   commands:
                     - |
-                      sudo su
-                      su - ubuntu
-                      cd ~
-                      sudo systemctl stop apt-daily.timer
-                      sudo systemctl stop apt-daily.service
-                      sudo systemctl stop apt-daily-upgrade.service
-                      sudo apt upgrade -y && sudo apt upgrade -y
-                      sudo apt autoremove -y
-                      wget https://golang.org/dl/go1.17.2.linux-amd64.tar.gz
-                      sudo tar -C /usr/local -xzf go1.17.2.linux-amd64.tar.gz
-                      export PATH=$PATH:/usr/local/go/bin
-                      go install github.com/sigstore/cosign/cmd/cosign@latest
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli-linux
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli-linux.sig
-                      wget https://github.com/teamdfir/sift-cli/releases/download/v1.14.0-rc1/sift-cli.pub
-                      /home/ubuntu/go/bin/cosign verify-blob -key sift-cli.pub -signature sift-cli-linux.sig sift-cli-linux
-                      sudo mv sift-cli-linux /usr/local/bin/sift
-                      chmod 755 /usr/local/bin/sift
-                      sudo sift install --mode=server --user=ubuntu
+                      wget https://github.com/ekristen/cast/releases/download/v0.14.0/cast_v0.14.0_linux_amd64.deb
+                      sudo dpkg -i cast_v0.14.0_linux_amd64.deb
+                      sudo apt update && sudo apt upgrade -y
+                      sudo cast install --mode=server teamdfir/sift-saltstack
   #                    sudo sift install --mode=desktop --user=ubuntu
   # Recipe which references the latest (x.x.x) version of Ubuntu Server 20 AMI.
   # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-imagerecipe.html
@@ -333,7 +318,7 @@ Resources:
       # regions use aws-cn and AWS GovCloud (US) regions are aws-us-gov.
       # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
       ParentImage:
-        Fn::Sub: arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/ubuntu-server-20-lts-x86/x.x.x
+        Fn::Sub: arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/ubuntu-server-22-lts-x86/x.x.x
       BlockDeviceMappings:
         - DeviceName: '/dev/sda1'
           Ebs:
