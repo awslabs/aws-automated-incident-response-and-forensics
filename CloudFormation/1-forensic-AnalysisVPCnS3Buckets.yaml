@@ -48,6 +48,9 @@ Resources:
         ServerSideEncryptionConfiguration: 
         - ServerSideEncryptionByDefault:
             SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
   
   S3ForensicScripts:
     Type: AWS::S3::Bucket
@@ -64,6 +67,9 @@ Resources:
             SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
   
   S3CloudFormationTemplates:
     Type: AWS::S3::Bucket
@@ -80,6 +86,9 @@ Resources:
             SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
 
   S3CloudTrailLogs:
     Type: AWS::S3::Bucket
@@ -94,6 +103,9 @@ Resources:
         ServerSideEncryptionConfiguration: 
         - ServerSideEncryptionByDefault:
             SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
   
   S3CloudTrailLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -132,6 +144,9 @@ Resources:
         ServerSideEncryptionConfiguration: 
         - ServerSideEncryptionByDefault:
             SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
 
   S3AWSConfigLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -176,6 +191,9 @@ Resources:
         ServerSideEncryptionConfiguration: 
         - ServerSideEncryptionByDefault:
             SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
 
   S3SessionManagerLogs:
     Type: AWS::S3::Bucket
@@ -190,6 +208,9 @@ Resources:
         ServerSideEncryptionConfiguration: 
         - ServerSideEncryptionByDefault:
             SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
 
   S3IRArtifactBucket:
     Type: AWS::S3::Bucket
@@ -225,6 +246,9 @@ Resources:
         BlockPublicPolicy: True
         IgnorePublicAcls: True
         RestrictPublicBuckets: True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
 
 # END: S3 buckets
 ##################################
@@ -265,7 +289,7 @@ Resources:
     Type: "AWS::IAM::Role"
     Properties:
       ManagedPolicyArns:
-        - "arn:aws:iam::aws:policy/service-role/AWSConfigRole"
+        - "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
